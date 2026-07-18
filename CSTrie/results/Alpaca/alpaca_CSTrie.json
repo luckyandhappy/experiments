@@ -1,0 +1,70 @@
+{
+  "experiment_meta": {
+    "timestamp": "2026-07-18 23:35:38",
+    "script": "run_formal_experiment.py"
+  },
+  "config": {
+    "model_path": "/home/hys/experiments/Qwen3-8B",
+    "datasets": [
+      "alpaca"
+    ],
+    "data_dir": "/home/hys/experiments/trie_cache_new/data",
+    "context_length": 4096,
+    "batch_size": 8,
+    "max_input_tokens": 1024
+  },
+  "dataset_summary": {
+    "num_samples": 31323,
+    "total_input_tokens": 381309,
+    "avg_tokens_per_sample": 12.17345081888708,
+    "per_dataset": {
+      "alpaca": {
+        "num_samples": 31323,
+        "total_tokens": 381309
+      }
+    }
+  },
+  "baseline": null,
+  "trie": {
+    "elapsed_seconds": 662.0471909046173,
+    "num_requests": 31323,
+    "trie_stats": {
+      "total_requests": 31323,
+      "num_leaves": 9176,
+      "num_prefill_batches": 720,
+      "num_normal_batches": 3196,
+      "num_prefill_requests": 5759,
+      "num_normal_requests": 25564,
+      "build_time_seconds": 0.376906156539917,
+      "schedule_time_seconds": 0.008218765258789062,
+      "depth_statistics": {
+        "min_prefill_depth": 1,
+        "max_prefill_depth": 17,
+        "avg_prefill_depth": 4.928459802048967
+      }
+    },
+    "metrics": {
+      "prefill_hit": 15840,
+      "peak_full_tokens": 12543,
+      "peak_radix_bytes": 1849646989.0311747,
+      "peak_radix_kib": 1806295.8877257565,
+      "peak_radix_mib": 1763.960827857184,
+      "total_request_cache_events": 31323,
+      "aggregate_hit_rate_micro": 0.3018234555177035,
+      "aggregate_hit_rate_micro_percent": 30.18234555177035,
+      "aggregate_hit_rate_macro": 0.32575720614978765,
+      "aggregate_hit_rate_macro_percent": 32.57572061497876,
+      "total_input_tokens_measured": 381309,
+      "total_hit_tokens_measured": 115088,
+      "all_request_cache_events": 31323,
+      "summary": {
+        "event": "summary",
+        "max_full_tokens": 0,
+        "max_radix_bytes": 0.0,
+        "timestamp": 1784388950.684403
+      },
+      "raw_events_count": 32046
+    }
+  },
+  "comparison": null
+}

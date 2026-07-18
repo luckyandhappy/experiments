@@ -1,0 +1,70 @@
+{
+  "experiment_meta": {
+    "timestamp": "2026-07-19 00:03:20",
+    "script": "run_formal_experiment.py"
+  },
+  "config": {
+    "model_path": "/home/hys/experiments/Qwen3-8B",
+    "datasets": [
+      "advbench"
+    ],
+    "data_dir": "/home/hys/experiments/trie_cache_new/data",
+    "context_length": 4096,
+    "batch_size": 8,
+    "max_input_tokens": 1024
+  },
+  "dataset_summary": {
+    "num_samples": 520,
+    "total_input_tokens": 6668,
+    "avg_tokens_per_sample": 12.823076923076924,
+    "per_dataset": {
+      "advbench": {
+        "num_samples": 520,
+        "total_tokens": 6668
+      }
+    }
+  },
+  "baseline": null,
+  "trie": {
+    "elapsed_seconds": 21.61260676383972,
+    "num_requests": 520,
+    "trie_stats": {
+      "total_requests": 520,
+      "num_leaves": 223,
+      "num_prefill_batches": 16,
+      "num_normal_batches": 50,
+      "num_prefill_requests": 121,
+      "num_normal_requests": 399,
+      "build_time_seconds": 0.0023717880249023438,
+      "schedule_time_seconds": 0.00021958351135253906,
+      "depth_statistics": {
+        "min_prefill_depth": 1,
+        "max_prefill_depth": 13,
+        "avg_prefill_depth": 6.363636363636363
+      }
+    },
+    "metrics": {
+      "prefill_hit": 285,
+      "peak_full_tokens": 485,
+      "peak_radix_bytes": 71520273.43379731,
+      "peak_radix_kib": 69844.01702519269,
+      "peak_radix_mib": 68.20704787616474,
+      "total_request_cache_events": 520,
+      "aggregate_hit_rate_micro": 0.33638272345530895,
+      "aggregate_hit_rate_micro_percent": 33.63827234553089,
+      "aggregate_hit_rate_macro": 0.3541192233089085,
+      "aggregate_hit_rate_macro_percent": 35.411922330890846,
+      "total_input_tokens_measured": 6668,
+      "total_hit_tokens_measured": 2243,
+      "all_request_cache_events": 520,
+      "summary": {
+        "event": "summary",
+        "max_full_tokens": 0,
+        "max_radix_bytes": 0.0,
+        "timestamp": 1784390612.4858718
+      },
+      "raw_events_count": 539
+    }
+  },
+  "comparison": null
+}
