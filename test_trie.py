@@ -28,11 +28,15 @@ trie_root_b = XXXTrieNode.build_vertical(request_token_seqs_map)
 
 merge = XXXTrieNode.merge(trie_root_a, trie_root_b, RequestDataLoader())
 
-a, b = schedule_heuristic(merge, 3)
-print(a)
-print(b)
+batches = schedule_heuristic(merge, 3)
+print(batches)
 
-a, b = simulate_heuristic_prefix(merge, 3)
+rid_to_seq = {
+    **{("A", i): seq for i, seq in enumerate(reqs_a)},
+    **{("B", i): seq for i, seq in enumerate(reqs_b)},
+}
+
+a, b = simulate_heuristic_prefix(merge, 3, rid_to_seq)
 print(a)
 print(b)
 

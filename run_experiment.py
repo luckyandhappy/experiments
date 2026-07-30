@@ -29,7 +29,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sglang as sgl
 from transformers import AutoTokenizer
@@ -231,7 +231,7 @@ async def _send_requests_with_cache_policy(
             try:
                 await llm.async_generate(
                     input_ids=seq, sampling_params=sp, stream=False, rid=sgl_rid,
-                    bootstrap_host=_FAKE_BOOTSTRAP_HOST,                    
+                    bootstrap_host=_FAKE_BOOTSTRAP_HOST,
                 )
             except Exception as exc:
                 print(f"[NORMAL] 请求 {sgl_rid} 失败: {exc}")
@@ -280,6 +280,66 @@ async def _send_requests_with_cache_policy(
                 await asyncio.gather(*tasks)
             print(f"    Batch {bi}: {len(tasks)} 请求完成")
         print(f"  [PHASE B] 正常执行全部完成")
+
+
+async def _send_scheduled_batches_with_cache_policy(
+    llm: sgl.Engine,
+    scheduled_batches: List[List[ScheduledRequest]],
+    rid_to_seq: Dict[RequestID, List[int]],
+    tokenizer_eos_id: int,
+    batch_size: int,
+) -> None:
+    """按统一时序批次交错执行预填充和普通请求。"""
+    sem = asyncio.Semaphore(batch_size * 2)
+
+    async def send(task: ScheduledRequest) -> None:
+        seq = rid_to_seq.get(task.request_id)
+        if seq is None:
+            raise KeyError(f"请求 {task.request_id} 无对应 token 序列")
+
+        async with sem:
+            dataset_name, idx = task.request_id
+            prefix = "P" if task.kind == "prefill" else "N"
+            sgl_rid = f"{prefix}:{dataset_name}:{idx:04d}"
+            sp = {
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+                "stop_token_ids": [tokenizer_eos_id],
+                "skip_special_tokens": True,
+            }
+            kwargs = {}
+            if task.kind == "prefill":
+                sp["custom_params"] = {
+                    "custom_cache_prefix_len": task.cache_prefix_len,
+                }
+            else:
+                kwargs["bootstrap_host"] = _FAKE_BOOTSTRAP_HOST
+
+            try:
+                await llm.async_generate(
+                    input_ids=seq,
+                    sampling_params=sp,
+                    stream=False,
+                    rid=sgl_rid,
+                    **kwargs,
+                )
+            except Exception as exc:
+                print(f"[{task.kind.upper()}] 请求 {sgl_rid} 失败: {exc}")
+                if task.kind == "prefill":
+                    # 生产者失败后不能继续执行依赖它的后续批次。
+                    raise
+
+    print(f"  [SCHEDULE] 交错调度: {len(scheduled_batches)} 批")
+    for batch_index, batch in enumerate(scheduled_batches):
+        if not batch:
+            continue
+        await asyncio.gather(*(send(task) for task in batch))
+        prefill_count = sum(task.kind == "prefill" for task in batch)
+        print(
+            f"    Batch {batch_index}: {len(batch)} 请求完成 "
+            f"(prefill={prefill_count}, normal={len(batch) - prefill_count})"
+        )
+    print("  [SCHEDULE] 全部时序批次完成")
 
 
 async def _send_requests_baseline(
@@ -445,6 +505,9 @@ async def run_trie_experiment(
     rid_to_seq: Dict[RequestID, List[int]] = {rid: seq for rid, seq in flat_seqs}
 
     # ---- Phase 3: 调度 ----
+    scheduled_batches: Optional[List[List[ScheduledRequest]]] = None
+    prefill_batches: List[List[List]] = []
+    normal_batches: List[List[List]] = []
     if config.scheduler == "bfs":
         print("[TRIE] Phase 2: 执行 BFS 调度 ...")
         t_sched_start = time.time()
@@ -466,28 +529,59 @@ async def run_trie_experiment(
     else:
         print("[TRIE] Phase 2: 执行启发式调度 ...")
         t_sched_start = time.time()
-        prefill_batches, normal_batches = schedule_heuristic(root, config.batch_size)
+        scheduled_batches = schedule_heuristic(root, config.batch_size)
         t_sched = time.time() - t_sched_start
         # 模拟缓存命中情况
-        prefill_prefix, execute_prefix = simulate_heuristic_prefix(root, config.batch_size, rid_to_seq)
+        prefill_prefix, execute_prefix = simulate_heuristic_prefix(
+            root,
+            config.batch_size,
+            rid_to_seq,
+            scheduled_batches=scheduled_batches,
+        )
         print(f"启发式 - 预填充阶段模拟命中: {prefill_prefix}")
         print(f"启发式 - 后续执行阶段模拟命中: {execute_prefix}")
 
-    total_prefill = sum(len(b) for b in prefill_batches)
-    total_normal = sum(len(b) for b in normal_batches)
     print(f"  调度耗时: {t_sched:.2f}s")
-    print(f"  预填充批次数: {len(prefill_batches)}, 共 {total_prefill} 请求")
-    print(f"  正常执行批次数: {len(normal_batches)}, 共 {total_normal} 请求")
-
-    # 预填充批次详情
-    for i, batch in enumerate(prefill_batches):
-        print(batch)
-        depths = [item[1] for item in batch]
-        print(f"    Prefill Batch {i:02d}: {len(batch)} 请求, "
-              f"深度范围 [{min(depths)}, {max(depths)}]")
+    if scheduled_batches is not None:
+        all_tasks = [task for batch in scheduled_batches for task in batch]
+        total_prefill = sum(task.kind == "prefill" for task in all_tasks)
+        total_normal = len(all_tasks) - total_prefill
+        prefill_batch_count = sum(
+            any(task.kind == "prefill" for task in batch)
+            for batch in scheduled_batches
+        )
+        normal_batch_count = sum(
+            any(task.kind == "normal" for task in batch)
+            for batch in scheduled_batches
+        )
+        all_prefill_depths = [
+            task.cache_prefix_len
+            for task in all_tasks
+            if task.kind == "prefill" and task.cache_prefix_len is not None
+        ]
+        print(f"  统一时序批次数: {len(scheduled_batches)}")
+        print(f"  预填充请求: {total_prefill}, 正常请求: {total_normal}")
+        for i, batch in enumerate(scheduled_batches):
+            prefill_count = sum(task.kind == "prefill" for task in batch)
+            print(
+                f"    Scheduled Batch {i:02d}: {len(batch)} 请求, "
+                f"prefill={prefill_count}, normal={len(batch) - prefill_count}"
+            )
+    else:
+        total_prefill = sum(len(b) for b in prefill_batches)
+        total_normal = sum(len(b) for b in normal_batches)
+        prefill_batch_count = len(prefill_batches)
+        normal_batch_count = len(normal_batches)
+        print(f"  预填充批次数: {prefill_batch_count}, 共 {total_prefill} 请求")
+        print(f"  正常执行批次数: {normal_batch_count}, 共 {total_normal} 请求")
+        for i, batch in enumerate(prefill_batches):
+            print(batch)
+            depths = [item[1] for item in batch]
+            print(f"    Prefill Batch {i:02d}: {len(batch)} 请求, "
+                  f"深度范围 [{min(depths)}, {max(depths)}]")
+        all_prefill_depths = [item[1] for b in prefill_batches for item in b]
 
     # 统计预填充深度分布
-    all_prefill_depths = [item[1] for b in prefill_batches for item in b]
     if all_prefill_depths:
         print(f"  预填充深度: min={min(all_prefill_depths)}, "
               f"max={max(all_prefill_depths)}, "
@@ -495,18 +589,25 @@ async def run_trie_experiment(
 
     # 验证调度覆盖完整性
     scheduled_rids: Set[RequestID] = set()
-    for batch in prefill_batches:
-        for item in batch:
-            scheduled_rids.add(item[0])
-    for batch in normal_batches:
-        for item in batch:
-            if isinstance(item, (list, tuple)) and len(item) >= 1:
+    if scheduled_batches is not None:
+        scheduled_rids = {
+            task.request_id for batch in scheduled_batches for task in batch
+        }
+    else:
+        for batch in prefill_batches:
+            for item in batch:
                 scheduled_rids.add(item[0])
-            else:
-                scheduled_rids.add(item)
+        for batch in normal_batches:
+            for item in batch:
+                if isinstance(item, (list, tuple)) and len(item) >= 1:
+                    scheduled_rids.add(item[0])
+                else:
+                    scheduled_rids.add(item)
 
     all_rids = {rid for rid, _ in flat_seqs}
     uncovered = all_rids - scheduled_rids
+    if uncovered and scheduled_batches is not None:
+        raise AssertionError(f"启发式调度器遗漏 {len(uncovered)} 个请求: {sorted(uncovered)}")
     if uncovered:
         print(f"  [WARN] {len(uncovered)} 个请求未被调度器覆盖, "
               f"将追加到 normal_batches 末尾")
@@ -535,14 +636,23 @@ async def run_trie_experiment(
     )
 
     try:
-        await _send_requests_with_cache_policy(
-            llm=llm,
-            prefill_batches=prefill_batches,
-            normal_batches=normal_batches,
-            rid_to_seq=rid_to_seq,
-            tokenizer_eos_id=tokenizer.eos_token_id,
-            batch_size=config.batch_size,
-        )
+        if scheduled_batches is not None:
+            await _send_scheduled_batches_with_cache_policy(
+                llm=llm,
+                scheduled_batches=scheduled_batches,
+                rid_to_seq=rid_to_seq,
+                tokenizer_eos_id=tokenizer.eos_token_id,
+                batch_size=config.batch_size,
+            )
+        else:
+            await _send_requests_with_cache_policy(
+                llm=llm,
+                prefill_batches=prefill_batches,
+                normal_batches=normal_batches,
+                rid_to_seq=rid_to_seq,
+                tokenizer_eos_id=tokenizer.eos_token_id,
+                batch_size=config.batch_size,
+            )
         print("[TRIE] 所有请求执行完成")
     finally:
         print("[TRIE] 关闭 Engine ...")
@@ -552,14 +662,38 @@ async def run_trie_experiment(
     elapsed = time.time() - t0
     print(f"[TRIE] 完成, 总耗时 {elapsed:.1f}s")
 
+    if scheduled_batches is not None:
+        batches_detail = [
+            {
+                "phase": "mixed",
+                "batch_idx": i,
+                "size": len(batch),
+                "prefill_count": sum(task.kind == "prefill" for task in batch),
+                "normal_count": sum(task.kind == "normal" for task in batch),
+            }
+            for i, batch in enumerate(scheduled_batches)
+        ]
+        num_scheduled_batches = len(scheduled_batches)
+    else:
+        batches_detail = [
+            {"phase": "prefill", "batch_idx": i, "size": len(batch)}
+            for i, batch in enumerate(prefill_batches)
+        ] + [
+            {"phase": "normal", "batch_idx": i, "size": len(batch)}
+            for i, batch in enumerate(normal_batches)
+        ]
+        num_scheduled_batches = len(prefill_batches) + len(normal_batches)
+
     return {
         "elapsed_seconds": elapsed,
         "num_requests": len(flat_seqs),
         "trie_stats": {
             "total_requests": total_reqs_in_trie,
             "num_leaves": num_leaves,
-            "num_prefill_batches": len(prefill_batches),
-            "num_normal_batches": len(normal_batches),
+            "num_scheduled_batches": num_scheduled_batches,
+            # 兼容字段：在交错调度中，同一批可能同时计入两者。
+            "num_prefill_batches": prefill_batch_count,
+            "num_normal_batches": normal_batch_count,
             "num_prefill_requests": total_prefill,
             "num_normal_requests": total_normal,
             "build_time_seconds": t_build,
@@ -573,13 +707,7 @@ async def run_trie_experiment(
                 ),
             },
         },
-        "batches_detail": [
-            {"phase": "prefill", "batch_idx": i, "size": len(b)}
-            for i, b in enumerate(prefill_batches)
-        ] + [
-            {"phase": "normal", "batch_idx": i, "size": len(b)}
-            for i, b in enumerate(normal_batches)
-        ],
+        "batches_detail": batches_detail,
     }
 
 
