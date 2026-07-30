@@ -191,6 +191,45 @@ $$
 
 ### Ⅳ	实验计划
 
+#### 运行原生推理框架基线
+
+`run_experiment.py` 支持两种互斥的运行模式：
+
+```bash
+# 保持原有流程：运行 SGLang 基线和 CSTrie（可继续使用 skip 参数）
+python run_experiment.py --backend sglang
+
+# 只运行 vLLM 0.26.x 原生 Automatic Prefix Caching 基线
+python run_experiment.py --backend vllm
+```
+
+vLLM 模式要求 `vllm>=0.26.0,<0.27.0`，使用进程内异步引擎和 token ID
+输入，并开启原生 prefix caching。该模式不会导入或启动 SGLang，不会构建
+CSTrie，也不会执行调度器。可通过 `--gpu-memory-utilization` 调整引擎可用的
+GPU 显存比例。CUDA attention backend 不支持 2-token 的物理 KV block，因此
+物理 `block_size` 使用 vLLM 默认支持的 16 tokens，并设置
+`prefix_match_unit=2`，使 APC 能以 2-token 边界进行前缀匹配。例如：
+
+```bash
+python run_experiment.py \
+  --backend vllm \
+  --gpu-memory-utilization 0.8 \
+  --batch-size 8 \
+  --datasets advbench alpaca
+```
+
+vLLM 结果直接写入 `--output` 指定的 JSON。结果中的 `trie` 和 `comparison`
+为 `null`，SGLang RadixCache 专属指标同样为 `null`。`baseline.metrics` 包含
+峰值驻留缓存 token、累计缓存写入 token、命中 token，以及按完整 Prompt
+计算的 Micro/Macro 命中率；`backend_metrics` 另行保留 vLLM 原生的
+query-token 命中率和峰值 KV cache 使用率。
+
+缓存 token 容量来自 vLLM `cache_config_info` 中 group-aware 的
+`kv_cache_size_tokens`。当自动显存分配没有暴露 `kv_cache_memory_bytes` 时，
+`cache_capacity_bytes`、`peak_cache_bytes`、`peak_cache_kib` 和
+`peak_cache_mib` 为 `null`，`cache_bytes_available` 为 `false`；程序不会用
+模型结构推测可能不准确的缓存字节数。
+
 ##### 4.1	`CSTrie` 实验计划
 
 1. 将基于 `CSTrie` 的前缀缓存策略和直接在 `vLLM`、`SGLang` 上执行的基线情况进行对比，主要对比这几种策略之间的缓存 Token 量、缓存大小 (`MiB`) 以及综合缓存命中率

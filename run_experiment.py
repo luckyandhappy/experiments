@@ -1,9 +1,9 @@
 """
 CSTrie 缓存命中率对比实验
 ====================================
-实验目的: 对比基于 CSTrie 的前缀缓存策略与 SGLang 原生基线在前缀缓存效率上的差异
+实验目的: 对比基于 CSTrie 的前缀缓存策略与推理框架原生基线在前缀缓存效率上的差异
 实验组:
-  1. SGLang 基线: 不进行任何前缀缓存预填充优化, 依赖 SGLang 内置 RadixCache
+  1. 原生基线: 可选择 SGLang RadixCache 或 vLLM Automatic Prefix Caching
   2. CSTrie 策略: 使用 CSTrie 预先计算共享前缀, 结合启发式调度算法进行缓存预填充
 控制变量:
   - 批处理大小 (BATCH_SIZE)
@@ -25,18 +25,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
+import importlib.metadata
+import inspect
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-import sglang as sgl
-from transformers import AutoTokenizer
-
-# ---- 已有实现（不可修改） ----
-from xxxtrie import XXXTrieNode, RequestID
-from scheduler import *
+# vLLM 模式不能隐式依赖 SGLang、Trie 或调度器，因此这些模块只在
+# SGLang/CSTrie 分支中加载。RequestID 是二元组，可安全地在此定义。
+RequestID = Tuple[str, int]
 
 
 # ============================================================
@@ -62,6 +63,11 @@ _TRIE_METRICS_LOG = os.path.join(_EXPERIMENT_DIR, "trie_metrics.jsonl")
 CONTEXT_LENGTH = 4096
 MAX_INPUT_TOKENS = 1024
 BATCH_SIZE = 8
+GPU_MEMORY_UTILIZATION = 0.8
+VLLM_MIN_VERSION = (0, 26)
+VLLM_MAX_VERSION = (0, 27)
+VLLM_BLOCK_SIZE = 16
+VLLM_PREFIX_MATCH_UNIT = 2
 
 # 用于标明跳过 RadixCache 写入的 bootstrap_host 占位值
 _FAKE_BOOTSTRAP_HOST = "2.2.2.2"
@@ -184,8 +190,17 @@ def compute_total_tokens(
 # SGLang 请求发送
 # ============================================================
 
+def _load_sglang():
+    """只在 SGLang 实验分支导入运行时依赖。"""
+    try:
+        return importlib.import_module("sglang")
+    except ImportError as exc:
+        raise RuntimeError(
+            "选择了 SGLang 后端，但当前环境未安装 sglang"
+        ) from exc
+
 async def _send_requests_with_cache_policy(
-    llm: sgl.Engine,
+    llm: Any,
     prefill_batches: List[List[List]],
     normal_batches: List[List[List]],
     rid_to_seq: Dict[RequestID, List[int]],
@@ -283,8 +298,8 @@ async def _send_requests_with_cache_policy(
 
 
 async def _send_scheduled_batches_with_cache_policy(
-    llm: sgl.Engine,
-    scheduled_batches: List[List[ScheduledRequest]],
+    llm: Any,
+    scheduled_batches: List[List[Any]],
     rid_to_seq: Dict[RequestID, List[int]],
     tokenizer_eos_id: int,
     batch_size: int,
@@ -343,7 +358,7 @@ async def _send_scheduled_batches_with_cache_policy(
 
 
 async def _send_requests_baseline(
-    llm: sgl.Engine,
+    llm: Any,
     flat_seqs: List[Tuple[RequestID, List[int]]],
     tokenizer_eos_id: int,
     batch_size: int,
@@ -387,6 +402,7 @@ class ExperimentConfig:
     max_input_tokens: int
     metrics_log_path: str
     scheduler: str
+    gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION
 
 
 async def run_baseline_experiment(
@@ -394,6 +410,7 @@ async def run_baseline_experiment(
     flat_seqs: List[Tuple[RequestID, List[int]]],
 ) -> Dict[str, Any]:
     """执行 SGLang 基线实验"""
+    sgl = _load_sglang()
     if os.path.exists(config.metrics_log_path):
         os.remove(config.metrics_log_path)
 
@@ -411,7 +428,7 @@ async def run_baseline_experiment(
     t0 = time.time()
 
     print("[BASELINE] 加载 tokenizer ...")
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = _load_tokenizer_cls().from_pretrained(
         config.model_path, trust_remote_code=True, use_fast=True
     )
     if tokenizer.eos_token_id is None:
@@ -421,7 +438,7 @@ async def run_baseline_experiment(
     llm = sgl.Engine(
         model_path=config.model_path,
         tp_size=1,
-        mem_fraction_static=0.8,
+        mem_fraction_static=config.gpu_memory_utilization,
         trust_remote_code=True,
         dtype="auto",
         context_length=config.context_length,
@@ -456,6 +473,406 @@ async def run_baseline_experiment(
     }
 
 
+def validate_vllm_version(version: Optional[str] = None) -> str:
+    """验证 vLLM 主次版本为 0.26，并返回完整版本字符串。"""
+    if version is None:
+        try:
+            version = importlib.metadata.version("vllm")
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                "选择了 vLLM 后端，但当前环境未安装 vllm>=0.26.0,<0.27.0"
+            ) from exc
+
+    match = re.match(r"^(\d+)\.(\d+)(?:\.|$)", version)
+    if match is None:
+        raise RuntimeError(f"无法解析 vLLM 版本: {version!r}")
+    major_minor = (int(match.group(1)), int(match.group(2)))
+    if not (VLLM_MIN_VERSION <= major_minor < VLLM_MAX_VERSION):
+        raise RuntimeError(
+            f"不支持 vLLM {version}；需要 vllm>=0.26.0,<0.27.0"
+        )
+    return version
+
+
+@dataclass(frozen=True)
+class _VLLMMetricSnapshot:
+    """vLLM 数值指标和 Info 指标中携带的缓存配置。"""
+
+    values: Dict[str, float]
+    cache_configs: Tuple[Dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _VLLMRequestMetrics:
+    """单个已完成 vLLM 请求的缓存统计。"""
+
+    request_id: str
+    input_tokens: int
+    cached_tokens: int
+    cache_creation_tokens: int
+    missing_cached_tokens: bool
+    missing_cache_creation_tokens: bool
+
+
+def _read_vllm_metric_snapshot() -> _VLLMMetricSnapshot:
+    """读取 vLLM 进程内 Prometheus 指标，保留 cache_config_info 标签。"""
+    try:
+        reader = importlib.import_module("vllm.v1.metrics.reader")
+        metrics: Iterable[Any] = reader.get_metrics_snapshot()
+    except (ImportError, AttributeError, RuntimeError):
+        return _VLLMMetricSnapshot(values={})
+
+    result: Dict[str, float] = {}
+    cache_configs: List[Dict[str, str]] = []
+    for metric in metrics:
+        name = str(getattr(metric, "name", ""))
+        labels = getattr(metric, "labels", {})
+        if name.replace(":", "_").endswith("cache_config_info"):
+            if isinstance(labels, dict):
+                cache_configs.append({str(k): str(v) for k, v in labels.items()})
+            continue
+        value = getattr(metric, "value", None)
+        if not name or not isinstance(value, (int, float)):
+            continue
+        # Gauge 的 KV 使用率不能跨 worker 求和；其余目标指标都是 Counter。
+        if name.endswith("kv_cache_usage_perc"):
+            result[name] = max(result.get(name, 0.0), float(value))
+        else:
+            result[name] = result.get(name, 0.0) + float(value)
+    return _VLLMMetricSnapshot(
+        values=result,
+        cache_configs=tuple(cache_configs),
+    )
+
+
+def _metric_value(snapshot: _VLLMMetricSnapshot, suffix: str) -> float:
+    """兼容 Prometheus 冒号名和 Python reader 的下划线名。"""
+    return sum(
+        value
+        for name, value in snapshot.values.items()
+        if name.replace(":", "_").endswith(suffix.replace(":", "_"))
+    )
+
+
+def _metric_value_any(
+    snapshot: _VLLMMetricSnapshot,
+    suffixes: Tuple[str, ...],
+) -> float:
+    """读取在不同 Prometheus client 版本中可能带 `_total` 的 Counter。"""
+    for suffix in suffixes:
+        matching_names = {
+            name: value
+            for name, value in snapshot.values.items()
+            if name.replace(":", "_").endswith(suffix.replace(":", "_"))
+        }
+        if matching_names:
+            return sum(matching_names.values())
+    return 0.0
+
+
+def _vllm_cache_config_int(
+    snapshots: Tuple[_VLLMMetricSnapshot, ...],
+    key: str,
+) -> Optional[int]:
+    """从 cache_config_info 标签读取正整数配置；重复 worker 取最大值。"""
+    values: List[int] = []
+    for snapshot in snapshots:
+        for config in snapshot.cache_configs:
+            raw_value = config.get(key)
+            if raw_value is None or raw_value.strip().lower() in {"", "none"}:
+                continue
+            try:
+                value = int(raw_value)
+            except ValueError:
+                continue
+            if value > 0:
+                values.append(value)
+    return max(values) if values else None
+
+
+def _load_tokenizer_cls():
+    try:
+        transformers = importlib.import_module("transformers")
+        return transformers.AutoTokenizer
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "运行实验需要安装 transformers，并提供 AutoTokenizer"
+        ) from exc
+
+
+async def _send_requests_vllm(
+    llm: Any,
+    sampling_params_cls: Any,
+    flat_seqs: List[Tuple[RequestID, List[int]]],
+    tokenizer_eos_id: int,
+    batch_size: int,
+) -> List[_VLLMRequestMetrics]:
+    """使用 vLLM 异步引擎提交原生 APC 基线请求。"""
+    sem = asyncio.Semaphore(batch_size * 2)
+    sampling_params = sampling_params_cls(
+        max_tokens=1,
+        temperature=0.0,
+        stop_token_ids=[tokenizer_eos_id],
+        skip_special_tokens=True,
+    )
+
+    async def run_one(
+        rid: RequestID,
+        seq: List[int],
+    ) -> _VLLMRequestMetrics:
+        async with sem:
+            dataset_name, idx = rid
+            request_id = f"{dataset_name}:{idx:04d}"
+            # 使用 token prompt，避免 vLLM 再次分词导致两个基线输入不一致。
+            prompt = {"prompt_token_ids": seq}
+            final_output: Any = None
+            async for output in llm.generate(
+                prompt,
+                sampling_params,
+                request_id=request_id,
+            ):
+                if bool(getattr(output, "finished", False)):
+                    final_output = output
+
+            if final_output is None:
+                raise RuntimeError(f"vLLM 请求 {request_id} 未返回 finished 输出")
+
+            cached_value = getattr(final_output, "num_cached_tokens", None)
+            creation_value = getattr(
+                final_output,
+                "num_cache_creation_tokens",
+                None,
+            )
+            return _VLLMRequestMetrics(
+                request_id=request_id,
+                input_tokens=len(seq),
+                cached_tokens=max(0, int(cached_value or 0)),
+                cache_creation_tokens=max(0, int(creation_value or 0)),
+                missing_cached_tokens=cached_value is None,
+                missing_cache_creation_tokens=creation_value is None,
+            )
+
+    return list(
+        await asyncio.gather(*(run_one(rid, seq) for rid, seq in flat_seqs))
+    )
+
+
+async def run_vllm_baseline_experiment(
+    config: ExperimentConfig,
+    flat_seqs: List[Tuple[RequestID, List[int]]],
+) -> Dict[str, Any]:
+    """执行 vLLM 0.26.x 原生 Automatic Prefix Caching 基线。"""
+    version = validate_vllm_version()
+    try:
+        vllm = importlib.import_module("vllm")
+        async_engine_args_cls = vllm.AsyncEngineArgs
+        async_engine_cls = vllm.AsyncLLMEngine
+        sampling_params_cls = vllm.SamplingParams
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "vLLM 0.26.x 缺少 AsyncLLMEngine/AsyncEngineArgs/SamplingParams API"
+        ) from exc
+
+    print(f"\n{'=' * 60}")
+    print(f"[BASELINE] 启动 vLLM {version} 原生 APC 基线")
+    print(f"{'=' * 60}")
+    print(f"  模型: {config.model_path}")
+    print(f"  上下文长度: {config.context_length}")
+    print(f"  批大小: {config.batch_size}")
+    print(f"  KV cache physical block size: {VLLM_BLOCK_SIZE} tokens")
+    print(f"  Prefix match unit: {VLLM_PREFIX_MATCH_UNIT} tokens")
+    print(f"  请求总数: {len(flat_seqs)}")
+
+    t0 = time.time()
+    print("[BASELINE] 加载 tokenizer ...")
+    tokenizer = _load_tokenizer_cls().from_pretrained(
+        config.model_path, trust_remote_code=True, use_fast=True
+    )
+    if tokenizer.eos_token_id is None:
+        raise ValueError("tokenizer.eos_token_id 不能为 None")
+
+    engine_args = async_engine_args_cls(
+        model=config.model_path,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        max_model_len=config.context_length,
+        max_num_seqs=config.batch_size,
+        block_size=VLLM_BLOCK_SIZE,
+        prefix_match_unit=VLLM_PREFIX_MATCH_UNIT,
+        enable_prefix_caching=True,
+        trust_remote_code=True,
+        dtype="auto",
+        enforce_eager=True,
+        disable_log_stats=False,
+    )
+    print("[BASELINE] 启动 vLLM AsyncLLMEngine ...")
+    llm = async_engine_cls.from_engine_args(engine_args)
+    before = _read_vllm_metric_snapshot()
+    peak_kv_usage = _metric_value(before, "kv_cache_usage_perc")
+    stop_sampling = asyncio.Event()
+
+    async def sample_kv_usage() -> None:
+        nonlocal peak_kv_usage
+        while not stop_sampling.is_set():
+            snapshot = _read_vllm_metric_snapshot()
+            peak_kv_usage = max(
+                peak_kv_usage,
+                _metric_value(snapshot, "kv_cache_usage_perc"),
+            )
+            try:
+                await asyncio.wait_for(stop_sampling.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+
+    sampler_task = asyncio.create_task(sample_kv_usage())
+    try:
+        print("[BASELINE] 发送请求 (vLLM 原生 APC) ...")
+        request_metrics = await _send_requests_vllm(
+            llm=llm,
+            sampling_params_cls=sampling_params_cls,
+            flat_seqs=flat_seqs,
+            tokenizer_eos_id=tokenizer.eos_token_id,
+            batch_size=config.batch_size,
+        )
+    finally:
+        stop_sampling.set()
+        await sampler_task
+        after = _read_vllm_metric_snapshot()
+        peak_kv_usage = max(
+            peak_kv_usage,
+            _metric_value(after, "kv_cache_usage_perc"),
+        )
+        print("[BASELINE] 关闭 vLLM Engine ...")
+        shutdown_result = llm.shutdown()
+        if inspect.isawaitable(shutdown_result):
+            await shutdown_result
+
+    elapsed = time.time() - t0
+    total_input_tokens = sum(len(seq) for _, seq in flat_seqs)
+    prompt_tokens = max(
+        0.0,
+        _metric_value_any(after, ("prompt_tokens", "prompt_tokens_total"))
+        - _metric_value_any(before, ("prompt_tokens", "prompt_tokens_total")),
+    )
+    cache_queries = max(
+        0.0,
+        _metric_value(after, "prefix_cache_queries")
+        - _metric_value(before, "prefix_cache_queries"),
+    )
+    cache_hits = max(
+        0.0,
+        _metric_value(after, "prefix_cache_hits")
+        - _metric_value(before, "prefix_cache_hits"),
+    )
+    native_hit_rate = cache_hits / cache_queries if cache_queries else 0.0
+    request_input_tokens = sum(item.input_tokens for item in request_metrics)
+    request_hit_tokens = sum(item.cached_tokens for item in request_metrics)
+    cache_creation_tokens = sum(
+        item.cache_creation_tokens for item in request_metrics
+    )
+    micro_hit_rate = (
+        request_hit_tokens / request_input_tokens if request_input_tokens else 0.0
+    )
+    per_request_hit_rates = [
+        item.cached_tokens / item.input_tokens
+        for item in request_metrics
+        if item.input_tokens
+    ]
+    macro_hit_rate = (
+        sum(per_request_hit_rates) / len(per_request_hit_rates)
+        if per_request_hit_rates
+        else 0.0
+    )
+    missing_cached_tokens = sum(
+        item.missing_cached_tokens for item in request_metrics
+    )
+    missing_cache_creation_tokens = sum(
+        item.missing_cache_creation_tokens for item in request_metrics
+    )
+    if missing_cached_tokens or missing_cache_creation_tokens:
+        print(
+            "[BASELINE] 警告: vLLM 请求输出缺少缓存统计字段，已按 0 处理 "
+            f"(num_cached_tokens={missing_cached_tokens}, "
+            f"num_cache_creation_tokens={missing_cache_creation_tokens})"
+        )
+
+    cache_capacity_tokens = _vllm_cache_config_int(
+        (after, before),
+        "kv_cache_size_tokens",
+    )
+    cache_capacity_bytes = _vllm_cache_config_int(
+        (after, before),
+        "kv_cache_memory_bytes",
+    )
+    peak_cache_tokens = (
+        round(cache_capacity_tokens * peak_kv_usage)
+        if cache_capacity_tokens is not None
+        else None
+    )
+    peak_cache_bytes = (
+        round(cache_capacity_bytes * peak_kv_usage)
+        if cache_capacity_bytes is not None
+        else None
+    )
+    peak_cache_kib = (
+        peak_cache_bytes / 1024.0 if peak_cache_bytes is not None else None
+    )
+    peak_cache_mib = (
+        peak_cache_bytes / (1024.0 * 1024.0)
+        if peak_cache_bytes is not None
+        else None
+    )
+    measured_input_tokens = request_input_tokens or (
+        int(prompt_tokens) if prompt_tokens else total_input_tokens
+    )
+    metrics = {
+        "prefill_hit": None,
+        "peak_full_tokens": peak_cache_tokens,
+        "peak_radix_bytes": None,
+        "peak_radix_kib": None,
+        "peak_radix_mib": None,
+        "cache_capacity_tokens": cache_capacity_tokens,
+        "peak_cache_tokens": peak_cache_tokens,
+        "cache_capacity_bytes": cache_capacity_bytes,
+        "peak_cache_bytes": peak_cache_bytes,
+        "peak_cache_kib": peak_cache_kib,
+        "peak_cache_mib": peak_cache_mib,
+        "cache_bytes_available": cache_capacity_bytes is not None,
+        "cache_creation_tokens": cache_creation_tokens,
+        "cache_hit_tokens": request_hit_tokens,
+        "aggregate_hit_rate_micro": micro_hit_rate,
+        "aggregate_hit_rate_micro_percent": micro_hit_rate * 100.0,
+        "aggregate_hit_rate_macro": macro_hit_rate,
+        "aggregate_hit_rate_macro_percent": macro_hit_rate * 100.0,
+        "total_input_tokens_measured": measured_input_tokens,
+        "total_hit_tokens_measured": request_hit_tokens,
+        "backend_metrics": {
+            "prefix_cache_query_tokens": int(cache_queries),
+            "prefix_cache_hit_tokens": int(cache_hits),
+            "native_micro_hit_rate": native_hit_rate,
+            "native_micro_hit_rate_percent": native_hit_rate * 100.0,
+            "peak_kv_cache_usage": peak_kv_usage,
+            "peak_kv_cache_usage_percent": peak_kv_usage * 100.0,
+            "missing_num_cached_tokens": missing_cached_tokens,
+            "missing_num_cache_creation_tokens": (
+                missing_cache_creation_tokens
+            ),
+        },
+    }
+    print(f"[BASELINE] 完成, 耗时 {elapsed:.1f}s")
+    return {
+        "backend": "vllm",
+        "backend_version": version,
+        "block_size": VLLM_BLOCK_SIZE,
+        "prefix_match_unit": VLLM_PREFIX_MATCH_UNIT,
+        "elapsed_seconds": elapsed,
+        "num_requests": len(flat_seqs),
+        "requests_per_second": len(flat_seqs) / elapsed if elapsed else 0.0,
+        "input_tokens_per_second": total_input_tokens / elapsed if elapsed else 0.0,
+        "metrics": metrics,
+    }
+
+
 async def run_trie_experiment(
     config: ExperimentConfig,
     request_token_seqs_map: Dict[str, List[List[int]]],
@@ -463,6 +880,16 @@ async def run_trie_experiment(
     dataset_names: List[str],
 ) -> Dict[str, Any]:
     """执行 CSTrie 前缀缓存预填充实验"""
+    sgl = _load_sglang()
+    from xxxtrie import XXXTrieNode
+    from scheduler import (
+        schedule_bfs,
+        schedule_dfs,
+        schedule_heuristic,
+        simulate_heuristic_prefix,
+        simulate_schedule_bfs,
+        simulate_schedule_dfs,
+    )
     if os.path.exists(config.metrics_log_path):
         os.remove(config.metrics_log_path)
 
@@ -482,7 +909,7 @@ async def run_trie_experiment(
 
     # ---- Phase 0: 加载 tokenizer ----
     print("[TRIE] Phase 0: 加载 tokenizer ...")
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = _load_tokenizer_cls().from_pretrained(
         config.model_path, trust_remote_code=True, use_fast=True
     )
     if tokenizer.eos_token_id is None:
@@ -623,7 +1050,7 @@ async def run_trie_experiment(
     llm = sgl.Engine(
         model_path=config.model_path,
         tp_size=1,  # 张量并行大小 (单张 GPU)
-        mem_fraction_static=0.8,
+        mem_fraction_static=config.gpu_memory_utilization,
         trust_remote_code=True,
         dtype="auto",
         context_length=config.context_length,
@@ -846,7 +1273,16 @@ async def main() -> None:
   # 自定义参数
   python run_experiment.py --batch-size 16 --max-input-tokens 4096
   python run_experiment.py --datasets advbench alpaca
+
+  # 独立运行 vLLM 0.26.x 原生 APC 基线（不会加载 SGLang/CSTrie）
+  python run_experiment.py --backend vllm
         """,
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("sglang", "vllm"),
+        default="sglang",
+        help="实验后端；vllm 模式只运行原生 APC 基线 (默认: sglang)",
     )
     parser.add_argument(
         "--model-path",
@@ -875,6 +1311,12 @@ async def main() -> None:
         type=int,
         default=BATCH_SIZE,
         help=f"批大小 (默认: {BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=GPU_MEMORY_UTILIZATION,
+        help=f"推理引擎可使用的 GPU 显存比例 (默认: {GPU_MEMORY_UTILIZATION})",
     )
     parser.add_argument(
         "--max-input-tokens",
@@ -913,6 +1355,10 @@ async def main() -> None:
         help=f"调度器列表 (默认: {DEFAULT_SCHEDULER})",
     )
     args = parser.parse_args()
+    if not 0.0 < args.gpu_memory_utilization <= 1.0:
+        parser.error("--gpu-memory-utilization 必须在 (0, 1] 范围内")
+    if args.backend == "vllm" and args.skip_baseline:
+        parser.error("--backend vllm 只运行基线，不能同时指定 --skip-baseline")
 
     # ============================================================
     # Step 1: 加载数据集并 Token 化
@@ -928,7 +1374,7 @@ async def main() -> None:
     print(f"  总样本数: {total_prompts}")
 
     print(f"\n  加载 tokenizer: {args.model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = _load_tokenizer_cls().from_pretrained(
         args.model_path, trust_remote_code=True, use_fast=True
     )
     if tokenizer.eos_token_id is None:
@@ -958,12 +1404,14 @@ async def main() -> None:
             "script": os.path.basename(__file__),
         },
         "config": {
+            "backend": args.backend,
             "model_path": args.model_path,
             "datasets": args.datasets,
             "data_dir": args.data_dir,
             "context_length": args.context_length,
             "batch_size": args.batch_size,
             "max_input_tokens": args.max_input_tokens,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
         },
         "dataset_summary": {
             "num_samples": len(flat_seqs),
@@ -990,28 +1438,77 @@ async def main() -> None:
             max_input_tokens=args.max_input_tokens,
             metrics_log_path=args.baseline_metrics,
             scheduler=args.scheduler,
+            gpu_memory_utilization=args.gpu_memory_utilization,
         )
-        baseline_info = await run_baseline_experiment(
-            config=baseline_config,
-            flat_seqs=flat_seqs,
-        )
-        print("\n[ANALYSIS] 解析基线指标日志 ...")
-        baseline_metrics = parse_metrics_log(
-            args.baseline_metrics, rid_prefix=""
-        )
-        results["baseline"] = {
-            **baseline_info,
-            "metrics": baseline_metrics,
-        }
-        print(f"  峰值缓存 Token:  {baseline_metrics['peak_full_tokens']}")
-        print(f"  峰值缓存 (MiB):  {baseline_metrics['peak_radix_mib']:.2f}")
-        print(f"  Micro 命中率:    {baseline_metrics['aggregate_hit_rate_micro_percent']:.2f}%")
-        print(f"  Macro 命中率:    {baseline_metrics['aggregate_hit_rate_macro_percent']:.2f}%")
+        if args.backend == "vllm":
+            results["baseline"] = await run_vllm_baseline_experiment(
+                config=baseline_config,
+                flat_seqs=flat_seqs,
+            )
+            baseline_metrics = results["baseline"]["metrics"]
+            backend_metrics = baseline_metrics["backend_metrics"]
+            print("\n[ANALYSIS] vLLM 原生指标")
+            print(
+                "  Prefix cache 命中: "
+                f"{backend_metrics['prefix_cache_hit_tokens']} / "
+                f"{backend_metrics['prefix_cache_query_tokens']} tokens"
+            )
+            print(
+                "  Micro 命中率 (完整 Prompt): "
+                f"{baseline_metrics['aggregate_hit_rate_micro_percent']:.2f}%"
+            )
+            print(
+                "  Macro 命中率 (完整 Prompt): "
+                f"{baseline_metrics['aggregate_hit_rate_macro_percent']:.2f}%"
+            )
+            print(
+                "  Micro 命中率 (vLLM Query):  "
+                f"{backend_metrics['native_micro_hit_rate_percent']:.2f}%"
+            )
+            print(
+                "  累计缓存写入 Token:         "
+                f"{baseline_metrics['cache_creation_tokens']}"
+            )
+            print(
+                "  峰值缓存 Token / 总容量:    "
+                f"{baseline_metrics['peak_cache_tokens']} / "
+                f"{baseline_metrics['cache_capacity_tokens']}"
+            )
+            if baseline_metrics["cache_bytes_available"]:
+                print(
+                    "  峰值缓存大小 / 总容量:      "
+                    f"{baseline_metrics['peak_cache_mib']:.2f} / "
+                    f"{baseline_metrics['cache_capacity_bytes'] / (1024 ** 2):.2f} MiB"
+                )
+            else:
+                print("  峰值缓存大小:               unavailable")
+            print(
+                "  峰值 KV 使用率:             "
+                f"{backend_metrics['peak_kv_cache_usage_percent']:.2f}%"
+            )
+        else:
+            baseline_info = await run_baseline_experiment(
+                config=baseline_config,
+                flat_seqs=flat_seqs,
+            )
+            print("\n[ANALYSIS] 解析基线指标日志 ...")
+            baseline_metrics = parse_metrics_log(
+                args.baseline_metrics, rid_prefix=""
+            )
+            results["baseline"] = {
+                **baseline_info,
+                "backend": "sglang",
+                "metrics": baseline_metrics,
+            }
+            print(f"  峰值缓存 Token:  {baseline_metrics['peak_full_tokens']}")
+            print(f"  峰值缓存 (MiB):  {baseline_metrics['peak_radix_mib']:.2f}")
+            print(f"  Micro 命中率:    {baseline_metrics['aggregate_hit_rate_micro_percent']:.2f}%")
+            print(f"  Macro 命中率:    {baseline_metrics['aggregate_hit_rate_macro_percent']:.2f}%")
 
     # ============================================================
     # Step 4: CSTrie 实验
     # ============================================================
-    if not args.skip_trie:
+    if args.backend == "sglang" and not args.skip_trie:
         trie_config = ExperimentConfig(
             model_path=args.model_path,
             context_length=args.context_length,
@@ -1019,6 +1516,7 @@ async def main() -> None:
             max_input_tokens=args.max_input_tokens,
             metrics_log_path=args.trie_metrics,
             scheduler=args.scheduler,
+            gpu_memory_utilization=args.gpu_memory_utilization,
         )
         trie_info = await run_trie_experiment(
             config=trie_config,
@@ -1045,7 +1543,7 @@ async def main() -> None:
     # ============================================================
     # Step 4: 对比分析
     # ============================================================
-    if not args.skip_baseline and not args.skip_trie:
+    if args.backend == "sglang" and not args.skip_baseline and not args.skip_trie:
         print("\n" + "=" * 60)
         print("Step 4: 对比分析")
         print("=" * 60)
