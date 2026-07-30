@@ -1,3 +1,7 @@
 __pycache__/
 *.jsonl
 *.json
+
+!results/*
+!results/**/*.json
+!results/**/*.jsonl
