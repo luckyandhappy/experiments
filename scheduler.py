@@ -5,7 +5,7 @@ from itertools import islice
 import random
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Dict, Hashable, List, Literal, Optional, Set, Tuple
 from xxxtrie import XXXTrieNode
 
 RequestID = Tuple[str, int]
@@ -31,7 +31,7 @@ class ScheduledRequest:
 class _SchedulingCandidate:
     task: ScheduledRequest
     node: XXXTrieNode
-    path: Tuple[int, ...]
+    path: Tuple[Hashable, ...]
     dfs_order: int
     ready_batch: int = 0
 
@@ -42,8 +42,8 @@ def _ordered_children(node: XXXTrieNode) -> List[XXXTrieNode]:
 
 
 def _common_ancestor_depth(
-    left_path: Tuple[int, ...],
-    right_path: Tuple[int, ...],
+    left_path: Tuple[Hashable, ...],
+    right_path: Tuple[Hashable, ...],
 ) -> int:
     """返回两个节点路径的最近公共祖先相对深度。"""
     depth = 0
@@ -66,7 +66,7 @@ def schedule_heuristic(
         raise ValueError("batch_size 必须大于 0")
 
     parent: Dict[XXXTrieNode, Optional[XXXTrieNode]] = {root: None}
-    paths: Dict[XXXTrieNode, Tuple[int, ...]] = {}
+    paths: Dict[XXXTrieNode, Tuple[Hashable, ...]] = {}
     node_order: Dict[XXXTrieNode, int] = {}
     producers: List[_SchedulingCandidate] = []
     locked_requests: Dict[XXXTrieNode, List[RequestID]] = {}
@@ -85,7 +85,7 @@ def schedule_heuristic(
             ready_batch=ready_batch,
         )
 
-    def collect(node: XXXTrieNode, path: Tuple[int, ...]):
+    def collect(node: XXXTrieNode, path: Tuple[Hashable, ...]):
         paths[node] = path
         node_order[node] = len(node_order)
         request_ids = sorted(node.request_ids)

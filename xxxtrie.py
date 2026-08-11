@@ -8,7 +8,7 @@ import copy
 import random
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Hashable, List, Optional, Set, Tuple
 
 RequestID = Tuple[str, int]
 
@@ -21,11 +21,11 @@ class XXXTrieNode:
         children: 子节点字典, key 为该节点的下一 Token
     """
 
-    def __init__(self, token: Optional[int] = None, depth: int = 0, request_ids: Optional[Set[RequestID]] = None):
+    def __init__(self, token: Optional[Hashable] = None, depth: int = 0, request_ids: Optional[Set[RequestID]] = None):
         self.token = token
         self.depth = depth
         self.request_ids: Set[RequestID] = request_ids if request_ids is not None else set()
-        self.children: Dict[int, "XXXTrieNode"] = {}
+        self.children: Dict[Hashable, "XXXTrieNode"] = {}
 
     def is_leaf(self) -> bool:
         return len(self.children) == 0
@@ -58,7 +58,7 @@ class XXXTrieNode:
     @classmethod
     def build_vertical(
         cls,
-        request_token_seqs_map: Dict[str, List[List[int]]],
+        request_token_seqs_map: Dict[str, List[List[Hashable]]],
         req_indices: Optional[Set[RequestID]] = None,
         start_depth: int = 0,
     ) -> "XXXTrieNode":
@@ -88,7 +88,7 @@ class XXXTrieNode:
         depth = start_depth
 
         # 统计 start_depth 处 Token 与请求之间的计数关系 (即每个 Token 被哪些请求所持有)
-        groups: Dict[int, Set[RequestID]] = {}
+        groups: Dict[Hashable, Set[RequestID]] = {}
         for rid in active:
             name, idx = rid
             seq = request_token_seqs_map[name][idx]
@@ -115,7 +115,7 @@ class XXXTrieNode:
 
     def branch_extension(
         self,
-        request_token_seqs: List[List[int]],
+        request_token_seqs: List[List[Hashable]],
     ) -> "XXXTrieNode":
         """
         Trie 合并后, 从已有 Trie 节点开始继续扩展共享前缀
@@ -127,7 +127,7 @@ class XXXTrieNode:
         Returns: 进行正确延展后的分支根节点
         """
         # 统计当前 depth 位置, 各 Token 对应的 activate 请求集合
-        groups: Dict[int, Set[RequestID]] = {}
+        groups: Dict[Hashable, Set[RequestID]] = {}
 
         for idx, rid in enumerate(self.request_ids):
             name = rid[0]
@@ -247,8 +247,8 @@ class XXXTrieNode:
     def _collect_leaf_paths(
         cls,
         node: "XXXTrieNode",
-        path: List[int],
-        result: List[List[int]],
+        path: List[Hashable],
+        result: List[List[Hashable]],
     ):
         """收集 Trie 中所有 Root -> Leaf 路径"""
         if node.is_leaf():

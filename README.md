@@ -191,6 +191,67 @@ $$
 
 ### Ⅳ	实验计划
 
+#### 通用多模态缓存实验
+
+`run_multimodal_experiment.py` 通过 Python 适配器注册表支持 VQAv2、ChartQA
+和经典 MME。每个数据集独立构建 manifest、冷启动推理引擎和生成报告；当前
+只测缓存与推理性能，统一设置 `max_new_tokens=1`，不计算答案准确率。
+
+推理环境需要支持 Qwen3-VL 的 `transformers`、Pillow、`qwen-vl-utils`，
+vLLM 后端沿用本项目的 `vllm>=0.26.0,<0.27.0` 约束。CSTrie 后端还要求
+定制 SGLang 同时支持 `custom_cache_prefix_len`、`mm_hashes` 和缓存指标日志。
+
+```bash
+mkdir -p data/vqav2
+wget -P data/vqav2 https://cvmlp.s3.amazonaws.com/vqa/mscoco/vqa/v2_Questions_Val_mscoco.zip
+wget -P data/vqav2 https://images.cocodataset.org/zips/val2014.zip
+unzip data/vqav2/v2_Questions_Val_mscoco.zip -d data/vqav2
+unzip data/vqav2/val2014.zip -d data/vqav2
+```
+
+ChartQA 使用官方仓库中 `ChartQA Dataset/test/` 下的 `test_human.json`、
+`test_augmented.json` 和 `png/`；MME 使用官方
+`MME_Benchmark_release_version/`，其下应包含 `perception/` 与 `cognition/`。
+默认目录结构如下：
+
+```text
+data/
+├── vqav2/
+├── chartqa/ChartQA Dataset/test/
+└── mme/MME_Benchmark_release_version/
+```
+
+可以先只校验数据并生成可复现的 manifest，不加载模型：
+
+```bash
+python run_multimodal_experiment.py \
+  --datasets vqav2 chartqa mme \
+  --prepare-only
+```
+
+VQAv2 与 ChartQA 默认抽取 200 张图片并保留这些图片的全部问题；MME 默认
+运行全部 14 个子任务。显式传入 `--num-media` 时，MME 会按子任务分层抽样。
+正式实验默认运行 grouped/shuffled 两种顺序、三个后端和三次冷启动：
+
+```bash
+python run_multimodal_experiment.py \
+  --model-path /path/to/Qwen3-VL-8B-Instruct \
+  --datasets vqav2 chartqa mme \
+  --data-root data \
+  --backends sglang cstrie vllm \
+  --repetitions 3
+```
+
+可用 `--dataset-path chartqa=/custom/path` 和 `--split chartqa=test` 覆盖单个
+数据集设置。结果写入 `results/multimodal/<dataset>/`，根目录的
+`summary.json` 和 `summary.md` 汇总跨数据集结果。
+
+视觉缓存的 `potential_hits` 仅表示由重复图片推导出的理论机会；只有后端
+实际暴露的 encoder-cache 计数才会列为实测指标。
+SGLang 指标日志可使用逐请求字段 `encoder_cache_hit`，或累计字段
+`encoder_cache_hits`、`encoder_cache_misses`、`encoder_cache_entries` 和
+`encoder_cache_capacity_embeddings`；脚本会自动识别并归一化。
+
 #### 运行原生推理框架基线
 
 `run_experiment.py` 支持两种互斥的运行模式：
