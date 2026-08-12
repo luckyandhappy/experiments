@@ -66,11 +66,19 @@ def schedule_heuristic(
         raise ValueError("batch_size 必须大于 0")
 
     parent: Dict[XXXTrieNode, Optional[XXXTrieNode]] = {root: None}
-    paths: Dict[XXXTrieNode, Tuple[Hashable, ...]] = {}
-    node_order: Dict[XXXTrieNode, int] = {}
+    candidate_paths: Dict[XXXTrieNode, Tuple[Hashable, ...]] = {}
+    candidate_order: Dict[XXXTrieNode, int] = {}
     producers: List[_SchedulingCandidate] = []
     locked_requests: Dict[XXXTrieNode, List[RequestID]] = {}
     ready_candidates: List[_SchedulingCandidate] = []
+
+    def node_path(node: XXXTrieNode) -> Tuple[Hashable, ...]:
+        tokens: List[Hashable] = []
+        while node is not root:
+            tokens.append(node.token)
+            node = parent[node]
+        tokens.reverse()
+        return tuple(tokens)
 
     def make_normal_candidate(
         node: XXXTrieNode,
@@ -80,15 +88,21 @@ def schedule_heuristic(
         return _SchedulingCandidate(
             task=ScheduledRequest(rid, "normal"),
             node=node,
-            path=paths[node],
-            dfs_order=node_order[node],
+            path=candidate_paths[node],
+            dfs_order=candidate_order[node],
             ready_batch=ready_batch,
         )
 
-    def collect(node: XXXTrieNode, path: Tuple[Hashable, ...]):
-        paths[node] = path
-        node_order[node] = len(node_order)
+    # Explicit DFS avoids Python's recursion limit for long visual prefixes.
+    # Only request-bearing nodes need to retain candidate paths.
+    stack = [root]
+    visit_order = 0
+    while stack:
+        node = stack.pop()
         request_ids = sorted(node.request_ids)
+        if request_ids:
+            candidate_paths[node] = node_path(node)
+            candidate_order[node] = visit_order
 
         if node is root:
             ready_candidates.extend(
@@ -98,19 +112,21 @@ def schedule_heuristic(
             producers.append(_SchedulingCandidate(
                 task=ScheduledRequest(request_ids[0], "prefill", node.depth),
                 node=node,
-                path=path,
-                dfs_order=node_order[node],
+                path=candidate_paths[node],
+                dfs_order=candidate_order[node],
             ))
             if len(request_ids) > 1:
                 locked_requests[node] = request_ids[1:]
         elif request_ids:
             locked_requests[node] = request_ids
 
-        for child in _ordered_children(node):
+        children = _ordered_children(node)
+        for child in children:
             parent[child] = node
-            collect(child, path + (child.token,))
+        for child in reversed(children):
+            stack.append(child)
+        visit_order += 1
 
-    collect(root, ())
     available: List[_SchedulingCandidate] = producers + ready_candidates
     batches: List[List[ScheduledRequest]] = []
 

@@ -34,14 +34,21 @@ class XXXTrieNode:
         return len(self.request_ids) > 0
 
     def total_request_count(self) -> int:
-        return len(self.request_ids) + sum(
-            c.total_request_count() for c in self.children.values()
-        )
+        total = 0
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            total += len(node.request_ids)
+            stack.extend(node.children.values())
+        return total
 
     def collect_all_request_ids(self) -> Set[RequestID]:
-        ids = set(self.request_ids)
-        for c in self.children.values():
-            ids |= c.collect_all_request_ids()
+        ids: Set[RequestID] = set()
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            ids.update(node.request_ids)
+            stack.extend(node.children.values())
         return ids
 
     def collect_leaves(self) -> List["XXXTrieNode"]:
@@ -82,36 +89,38 @@ class XXXTrieNode:
                 for i in range(len(seqs)):
                     req_indices.add((dataset_name, i))
 
-        node = XXXTrieNode(depth=start_depth)
+        root = cls(depth=start_depth)
+        stack: List[Tuple[XXXTrieNode, Set[RequestID], int]] = [
+            (root, set(req_indices), start_depth)
+        ]
 
-        active: Set[RequestID] = set(req_indices)
-        depth = start_depth
+        while stack:
+            node, active, depth = stack.pop()
+            groups: Dict[Hashable, Set[RequestID]] = {}
+            for rid in active:
+                name, idx = rid
+                seq = request_token_seqs_map[name][idx]
+                if depth < len(seq):
+                    token = seq[depth]
+                    groups.setdefault(token, set()).add(rid)
 
-        # 统计 start_depth 处 Token 与请求之间的计数关系 (即每个 Token 被哪些请求所持有)
-        groups: Dict[Hashable, Set[RequestID]] = {}
-        for rid in active:
-            name, idx = rid
-            seq = request_token_seqs_map[name][idx]
-            if depth < len(seq):
-                t = seq[depth]
-                groups.setdefault(t, set()).add(rid)
+            shared = [
+                (token, ids) for token, ids in groups.items() if len(ids) >= 2
+            ]
+            remaining = set(active)
+            child_frames = []
+            for token, ids in shared:
+                child = cls(token=token, depth=depth + 1)
+                node.children[token] = child
+                remaining.difference_update(ids)
+                child_frames.append((child, ids, depth + 1))
 
-        # 找到 start_depth 处被 ≥2 请求共享的 Token
-        shared = {t: idxs for t, idxs in groups.items() if len(idxs) >= 2}
+            # 未进入共享子节点的请求停留在当前节点。反向压栈保持原递归
+            # 实现的深度优先访问顺序。
+            node.request_ids = remaining
+            stack.extend(reversed(child_frames))
 
-        for token, ids in shared.items():
-            child = cls.build_vertical(
-                request_token_seqs_map,
-                ids,
-                depth + 1
-            )
-            child.token = token
-            node.children[token] = child
-            active -= ids
-
-        # 未进入任何子节点的请求停留在此
-        node.request_ids = active
-        return node
+        return root
 
     def branch_extension(
         self,
