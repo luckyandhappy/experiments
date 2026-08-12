@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from multimodal_experiment import (
+    MME_CATEGORIES,
     ManifestSample,
     MultimodalSample,
     adapter_names,
@@ -132,6 +133,21 @@ def make_mme(root: Path) -> Path:
     return root / "mme"
 
 
+def make_mme_flat_files(root: Path) -> Path:
+    dataset = root / "mme" / "MME_Benchmark_release_version"
+    for domain, categories in MME_CATEGORIES.items():
+        for category in categories:
+            stem = f"{domain}-{category}"
+            category_dir = dataset / domain / category
+            category_dir.mkdir(parents=True)
+            (category_dir / f"{stem}.jpg").write_bytes(stem.encode())
+            (category_dir / f"{stem}.txt").write_text(
+                "Is this question one?\tYes\nIs this question two?\tNo\n",
+                encoding="utf-8",
+            )
+    return root / "mme"
+
+
 class DatasetAdapterTests(unittest.TestCase):
     def test_registry_contains_first_party_adapters(self):
         self.assertEqual(adapter_names(), ("chartqa", "mme", "vqav2"))
@@ -167,6 +183,16 @@ class DatasetAdapterTests(unittest.TestCase):
         self.assertEqual(full["num_samples"], 28)
         self.assertTrue(limited["sampling"]["stratified"])
         self.assertEqual(len({item["category"] for item in limited["records"]}), 2)
+
+    def test_mme_supports_questions_and_images_beside_each_other(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = make_mme_flat_files(Path(directory))
+            manifest = build_manifest(get_adapter("mme"), dataset, "all", None, 42)
+        self.assertEqual(manifest["num_media"], 14)
+        self.assertEqual(manifest["num_samples"], 28)
+        self.assertTrue(
+            all("questions_answers_YN" not in row["image_path"] for row in manifest["records"])
+        )
 
     def test_mme_requires_all_fourteen_official_categories(self):
         with tempfile.TemporaryDirectory() as directory:

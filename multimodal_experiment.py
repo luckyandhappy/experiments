@@ -188,15 +188,16 @@ class ChartQAAdapter(DatasetAdapter):
         return f"Answer the question using the chart.\n{sample.question}"
 
 
-def _resolve_mme_image(images_dir: Path, stem: str) -> Path:
-    direct = images_dir / stem
-    if direct.is_file():
-        return direct
-    for extension in IMAGE_EXTENSIONS:
-        candidate = images_dir / f"{stem}{extension}"
-        if candidate.is_file():
-            return candidate
-    return images_dir / f"{stem}.jpg"
+def _resolve_mme_image(image_dirs: Sequence[Path], stem: str) -> Path:
+    for images_dir in image_dirs:
+        direct = images_dir / stem
+        if direct.is_file():
+            return direct
+        for extension in IMAGE_EXTENSIONS:
+            candidate = images_dir / f"{stem}{extension}"
+            if candidate.is_file():
+                return candidate
+    return image_dirs[0] / f"{stem}.jpg"
 
 
 def _parse_mme_question_file(path: Path) -> List[Tuple[str, str]]:
@@ -227,43 +228,40 @@ class MMEAdapter(DatasetAdapter):
         base = dataset_root / "MME_Benchmark_release_version"
         if not base.is_dir():
             base = dataset_root
-        question_dirs = sorted(base.rglob("questions_answers_YN"))
-        if not question_dirs:
-            raise FileNotFoundError(f"未找到 MME questions_answers_YN 目录: {base}")
-        found_categories = {
-            (
-                next(
-                    (
-                        part
-                        for part in questions_dir.parent.parts
-                        if part in MME_CATEGORIES
-                    ),
-                    "unknown",
-                ),
-                questions_dir.parent.name,
-            )
-            for questions_dir in question_dirs
-        }
         expected_categories = {
             (domain, category)
             for domain, categories in MME_CATEGORIES.items()
             for category in categories
         }
-        missing_categories = expected_categories - found_categories
+        category_layouts: Dict[Tuple[str, str], Tuple[List[Path], List[Path]]] = {}
+        missing_categories = set()
+        for domain, category in sorted(expected_categories):
+            category_dir = base / domain / category
+            nested_questions = category_dir / "questions_answers_YN"
+            if nested_questions.is_dir():
+                question_files = sorted(nested_questions.glob("*.txt"))
+                image_dirs = [category_dir / "images", category_dir]
+            elif category_dir.is_dir():
+                # Some complete MME releases store each question .txt beside
+                # its image instead of using questions_answers_YN/images.
+                question_files = sorted(category_dir.glob("*.txt"))
+                image_dirs = [category_dir, category_dir / "images"]
+            else:
+                question_files = []
+                image_dirs = [category_dir]
+            if question_files:
+                category_layouts[(domain, category)] = (question_files, image_dirs)
+            else:
+                missing_categories.add((domain, category))
         if missing_categories:
             formatted = [f"{domain}/{category}" for domain, category in missing_categories]
             raise FileNotFoundError(f"MME 缺少官方子任务目录: {sorted(formatted)}")
         samples: List[MultimodalSample] = []
-        for questions_dir in question_dirs:
-            category_dir = questions_dir.parent
-            category = category_dir.name
-            domain = next(
-                (part for part in category_dir.parts if part in ("perception", "cognition")),
-                "unknown",
-            )
-            images_dir = category_dir / "images"
-            for question_file in sorted(questions_dir.glob("*.txt")):
-                image_path = _resolve_mme_image(images_dir, question_file.stem)
+        for (domain, category), (question_files, image_dirs) in sorted(
+            category_layouts.items()
+        ):
+            for question_file in question_files:
+                image_path = _resolve_mme_image(image_dirs, question_file.stem)
                 media_id = f"{domain}/{category}/{question_file.stem}"
                 for index, (question, answer) in enumerate(
                     _parse_mme_question_file(question_file)
