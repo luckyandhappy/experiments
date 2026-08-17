@@ -40,9 +40,11 @@ from multimodal_experiment import (
 )
 from xxxtrie import XXXTrieNode
 
-DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
-DEFAULT_DATA_ROOT = Path("data")
-DEFAULT_OUTPUT_DIR = Path("results")
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_MODEL = PROJECT_ROOT / "Qwen3-VL-8B-Instruct"
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results"
 
 
 def _max_image_pixels(
@@ -599,7 +601,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="可扩展的多模态缓存性能实验", allow_abbrev=False
     )
-    parser.add_argument("--model-path", default=DEFAULT_MODEL)
+    parser.add_argument("--model-path", default=str(DEFAULT_MODEL))
     parser.add_argument(
         "--datasets", nargs="+", choices=adapter_names(), default=adapter_names()
     )
@@ -615,10 +617,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument(
-        "--backends",
-        nargs="+",
+        "--backend",
         choices=("sglang", "cstrie", "vllm"),
-        default=("sglang", "cstrie", "vllm"),
+        default="sglang",
     )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
@@ -666,7 +667,7 @@ async def _run_dataset(
             "seed": args.seed,
             "repetitions": args.repetitions,
             "orders": ["grouped"],
-            "backends": list(args.backends),
+            "backend": args.backend,
         },
         "manifest": {key: value for key, value in manifest.items() if key != "records"},
         "experiments": {},
@@ -677,10 +678,7 @@ async def _run_dataset(
     samples = manifest_samples(manifest)
     requests: Optional[List[PreparedMultimodalRequest]] = None
     result["experiments"][order] = {}
-    # Starting vLLM before another backend tokenizes or initializes CUDA keeps
-    # its EngineCore spawn path isolated and reproducible.
-    execution_backends = sorted(args.backends, key=lambda backend: backend != "vllm")
-    for backend in execution_backends:
+    for backend in (args.backend,):
         runs: List[Dict[str, Any]] = []
         for repetition in range(args.repetitions):
             print(
@@ -776,7 +774,7 @@ def _standard_runs(
 
 async def main() -> None:
     args = parse_args()
-    if "vllm" in args.backends and not args.prepare_only:
+    if args.backend == "vllm" and not args.prepare_only:
         # Must run before AutoProcessor and prepare_requests create the Rust
         # tokenizer worker pool used by the parent process.
         run_experiment._configure_vllm_native_runtime()
@@ -801,12 +799,14 @@ async def main() -> None:
         "seed": args.seed,
         "repetitions": args.repetitions,
         "orders": ["grouped"],
-        "backends": sorted(args.backends),
+        "backend": args.backend,
         "splits": {
             dataset: args.splits.get(dataset, get_adapter(dataset).default_split)
             for dataset in args.datasets
         },
-        "vllm_block_size": run_experiment.VLLM_BLOCK_SIZE if "vllm" in args.backends else None,
+        "vllm_block_size": (
+            run_experiment.VLLM_BLOCK_SIZE if args.backend == "vllm" else None
+        ),
     }
     identity = build_identity(
         {dataset: manifest["records_sha256"] for dataset, manifest in manifests.items()},

@@ -229,18 +229,25 @@ python run_multimodal_experiment.py \
   --prepare-only
 ```
 
+模型、数据和结果目录会根据脚本位置自动定位为项目内的
+`Qwen3-VL-8B-Instruct`、`data/` 和 `CSTrie/results/`，因此无需显式传入
+`--model-path`、`--data-root` 或 `--output-dir`，从其他工作目录启动也不受影响。
+
 所有数据集使用固定的 10,000 张媒体上限：媒体总数不超过上限时全量运行；
 超过上限时按 `--seed` 确定性抽取 10,000 张，并保留这些媒体关联的全部问题。
-`--num-media` 和 shuffled 顺序已移除，正式实验只运行 grouped 顺序；默认对
-三个后端分别进行三次冷启动：
+`--num-media` 和 shuffled 顺序已移除，正式实验只运行 grouped 顺序；每次命令
+运行一个后端并进行三次冷启动。无参运行默认使用 SGLang 和全部三个数据集：
 
 ```bash
-python run_multimodal_experiment.py \
-  --model-path /path/to/Qwen3-VL-8B-Instruct \
-  --datasets vqav2 chartqa mme \
-  --data-root data \
-  --backends sglang cstrie vllm \
-  --repetitions 3
+source /home/mp/Projects/newcache/.venv_sglang/bin/activate
+python run_multimodal_experiment.py
+
+# 使用 vLLM 运行 ChartQA
+source /home/mp/Projects/newcache/.venv_vllm/bin/activate
+python run_multimodal_experiment.py --backend vllm --datasets chartqa
+
+# 使用 vLLM 运行 VQAv2
+python run_multimodal_experiment.py --backend vllm --datasets vqav2
 ```
 
 可用 `--dataset-path chartqa=/custom/path` 和 `--split chartqa=test` 覆盖单个

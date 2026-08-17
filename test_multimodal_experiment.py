@@ -27,8 +27,12 @@ from multimodal_experiment import (
     validate_samples,
 )
 from run_multimodal_experiment import (
+    DEFAULT_DATA_ROOT,
+    DEFAULT_MODEL,
+    DEFAULT_OUTPUT_DIR,
     _run_sglang_requests,
     _sglang_image_uri,
+    parse_args,
     parse_sglang_encoder_metrics,
     run_vllm,
 )
@@ -497,6 +501,39 @@ class SGLangAdapterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_defaults_are_project_anchored_and_match_text_cli_shape(self):
+        expected_project = Path(__file__).resolve().parent.parent
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            chdir(directory),
+            mock.patch.object(sys, "argv", ["run_multimodal_experiment.py"]),
+        ):
+            args = parse_args()
+
+        self.assertEqual(DEFAULT_MODEL, expected_project / "Qwen3-VL-8B-Instruct")
+        self.assertEqual(DEFAULT_DATA_ROOT, expected_project / "data")
+        self.assertEqual(DEFAULT_OUTPUT_DIR, Path(__file__).resolve().parent / "results")
+        self.assertEqual(args.model_path, str(DEFAULT_MODEL))
+        self.assertEqual(args.data_root, DEFAULT_DATA_ROOT)
+        self.assertEqual(args.output_dir, DEFAULT_OUTPUT_DIR)
+        self.assertEqual(args.backend, "sglang")
+        self.assertEqual(set(args.datasets), {"vqav2", "chartqa", "mme"})
+
+    def test_single_backend_option_and_removed_plural_option(self):
+        with mock.patch.object(
+            sys, "argv", ["run_multimodal_experiment.py", "--backend", "vllm", "--datasets", "chartqa"]
+        ):
+            args = parse_args()
+        self.assertEqual(args.backend, "vllm")
+        self.assertEqual(args.datasets, ["chartqa"])
+
+        completed = subprocess.run(
+            [sys.executable, "run_multimodal_experiment.py", "--backends", "vllm"],
+            cwd=".", capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("unrecognized arguments: --backends", completed.stderr)
+
     def test_prepare_only_builds_independent_dataset_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -527,7 +564,11 @@ class CLITests(unittest.TestCase):
             for dataset in ("vqav2", "chartqa", "mme"):
                 manifests = list(output.glob(f"*/*/artifacts/{dataset}/manifest.json"))
                 self.assertEqual(len(manifests), 1)
-            self.assertEqual(len(list(output.glob("*/*/result.json"))), 1)
+            result_paths = list(output.glob("*/*/result.json"))
+            self.assertEqual(len(result_paths), 1)
+            result = json.loads(result_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(result["config"]["backend"], "sglang")
+            self.assertNotIn("backends", result["config"])
             self.assertTrue((output / "results_report.md").is_file())
 
     def test_dataset_path_and_split_overrides(self):
