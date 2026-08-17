@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import run_experiment
@@ -149,12 +150,12 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
         run_trie = mock.AsyncMock()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            output = f"{tmpdir}/result.json"
+            output = f"{tmpdir}/results"
             argv = [
                 "run_experiment.py",
                 "--backend",
                 "vllm",
-                "--output",
+                "--output-dir",
                 output,
                 "--datasets",
                 "advbench",
@@ -189,15 +190,27 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await run_experiment.main()
 
-            with open(output, "r", encoding="utf-8") as result_file:
+            result_paths = list(Path(output).glob("advbench/*/result.json"))
+            self.assertEqual(len(result_paths), 1)
+            with result_paths[0].open("r", encoding="utf-8") as result_file:
                 result = json.load(result_file)
+            self.assertTrue((Path(output) / "results_report.md").is_file())
 
         run_vllm.assert_awaited_once()
         run_trie.assert_not_awaited()
+        self.assertEqual(result["schema_version"], 1)
         self.assertEqual(result["config"]["backend"], "vllm")
-        self.assertEqual(result["baseline"], baseline_result)
-        self.assertIsNone(result["trie"])
-        self.assertIsNone(result["comparison"])
+        self.assertEqual(result["runs"][0]["backend"], "vllm")
+        self.assertEqual(result["runs"][0]["details"], baseline_result)
+        self.assertEqual(result["summary"]["rows"][0]["total_tokens"], 2)
+
+    def test_old_output_file_option_is_removed(self):
+        completed = subprocess.run(
+            [sys.executable, "run_experiment.py", "--output", "result.json"],
+            cwd=".", capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("unrecognized arguments: --output", completed.stderr)
 
     async def test_vllm_uses_native_apc_without_cstrie_arguments(self):
         state = {"complete": False}

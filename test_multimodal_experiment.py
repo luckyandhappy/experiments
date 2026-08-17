@@ -525,8 +525,10 @@ class CLITests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             for dataset in ("vqav2", "chartqa", "mme"):
-                self.assertTrue((output / dataset / "manifest.json").is_file())
-            self.assertTrue((output / "summary.json").is_file())
+                manifests = list(output.glob(f"*/*/artifacts/{dataset}/manifest.json"))
+                self.assertEqual(len(manifests), 1)
+            self.assertEqual(len(list(output.glob("*/*/result.json"))), 1)
+            self.assertTrue((output / "results_report.md").is_file())
 
     def test_dataset_path_and_split_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -555,7 +557,8 @@ class CLITests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertTrue((output / "chartqa" / "manifest.json").is_file())
+            manifests = list(output.glob("chartqa/*/artifacts/chartqa/manifest.json"))
+            self.assertEqual(len(manifests), 1)
 
     def test_old_vqa_entrypoint_is_removed(self):
         self.assertFalse(Path("run_vqa_experiment.py").exists())

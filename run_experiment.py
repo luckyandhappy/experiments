@@ -33,7 +33,19 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from experiment_results import (
+    build_identity,
+    content_sha256,
+    make_envelope,
+    normalize_cache_metrics,
+    print_summary,
+    result_directory,
+    write_experiment,
+    write_results_summary,
+)
 
 # vLLM 模式不能隐式依赖 SGLang、Trie 或调度器，因此这些模块只在
 # SGLang/CSTrie 分支中加载。RequestID 是二元组，可安全地在此定义。
@@ -56,6 +68,7 @@ _DATA_DIR = os.path.join(
 
 # 实验输出目录
 _EXPERIMENT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_OUTPUT_DIR = Path(_EXPERIMENT_DIR) / "results"
 
 # 指标日志路径
 _BASELINE_METRICS_LOG = os.path.join(_EXPERIMENT_DIR, "baseline_metrics.jsonl")
@@ -1606,6 +1619,7 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description="CSTrie 缓存命中率对比实验",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
         epilog="""
 示例:
   # 全部实验
@@ -1673,18 +1687,19 @@ async def main() -> None:
     )
     parser.add_argument(
         "--baseline-metrics",
-        default=_BASELINE_METRICS_LOG,
-        help=f"基线指标日志路径 (默认: {_BASELINE_METRICS_LOG})",
+        default=None,
+        help="基线指标日志路径 (默认: 当前实验目录的 artifacts/)",
     )
     parser.add_argument(
         "--trie-metrics",
-        default=_TRIE_METRICS_LOG,
-        help=f"Trie 指标日志路径 (默认: {_TRIE_METRICS_LOG})",
+        default=None,
+        help="Trie 指标日志路径 (默认: 当前实验目录的 artifacts/)",
     )
     parser.add_argument(
-        "--output",
-        default=os.path.join(_EXPERIMENT_DIR, "results_formal.json"),
-        help="实验结果输出路径",
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"实验结果根目录 (默认: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--skip-baseline",
@@ -1742,6 +1757,31 @@ async def main() -> None:
             f"均值 {sum(seq_lens)/len(seq_lens):.1f}"
         )
 
+    dataset_hashes = {
+        name: content_sha256(seqs) for name, seqs in request_token_seqs_map.items()
+    }
+    identity_parameters = {
+        "experiment_kind": "text",
+        "model_path": str(Path(args.model_path).expanduser().resolve()),
+        "backend": args.backend,
+        "context_length": args.context_length,
+        "batch_size": args.batch_size,
+        "max_input_tokens": args.max_input_tokens,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "scheduler": args.scheduler,
+        "run_baseline": not args.skip_baseline,
+        "run_cstrie": args.backend == "sglang" and not args.skip_trie,
+        "vllm_block_size": VLLM_BLOCK_SIZE if args.backend == "vllm" else None,
+        "sglang_page_size": SGLANG_PAGE_SIZE if args.backend == "sglang" else None,
+    }
+    identity = build_identity(dataset_hashes, identity_parameters)
+    experiment_dir = result_directory(args.output_dir, identity)
+    artifacts_dir = experiment_dir / "artifacts"
+    if args.baseline_metrics is None:
+        args.baseline_metrics = str(artifacts_dir / "baseline_metrics.jsonl")
+    if args.trie_metrics is None:
+        args.trie_metrics = str(artifacts_dir / "trie_metrics.jsonl")
+
     # ============================================================
     # Step 2: 初始化结果容器
     # ============================================================
@@ -1784,6 +1824,23 @@ async def main() -> None:
         "trie": None,
         "comparison": None,
     }
+    prepared_envelope = make_envelope(
+        experiment_kind="text",
+        script=os.path.basename(__file__),
+        identity=identity,
+        config={**results["config"], **identity_parameters},
+        datasets={
+            name: {
+                **results["dataset_summary"]["per_dataset"][name],
+                "content_sha256": dataset_hashes[name],
+            }
+            for name in args.datasets
+        },
+        runs=[],
+        status="prepared",
+    )
+    write_experiment(prepared_envelope, experiment_dir)
+    write_results_summary(args.output_dir)
 
     # ============================================================
     # Step 3: 基线实验
@@ -2036,12 +2093,69 @@ async def main() -> None:
             comp["elapsed_diff_seconds"] = t_elapsed - b_elapsed
 
     # ============================================================
-    # 保存结果
+    # 统一保存结果
     # ============================================================
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"\n结果已保存至: {args.output}")
+    standard_runs: List[Dict[str, Any]] = []
+    for field, default_backend, cache_policy in (
+        ("baseline", args.backend, "native"),
+        ("trie", "cstrie", "cstrie"),
+    ):
+        aggregate = results.get(field)
+        if not isinstance(aggregate, dict):
+            continue
+        per_dataset = aggregate.get("per_dataset")
+        if not isinstance(per_dataset, dict) or not per_dataset:
+            combined_name = "+".join(sorted(args.datasets))
+            per_dataset = {combined_name: aggregate}
+        for dataset_name, item in per_dataset.items():
+            metrics_source = item.get("metrics", {})
+            dataset_total = (
+                results["dataset_summary"]["per_dataset"].get(dataset_name, {}).get("total_tokens")
+                if dataset_name in results["dataset_summary"]["per_dataset"]
+                else results["dataset_summary"]["total_input_tokens"]
+            )
+            request_count = (
+                len(request_token_seqs_map[dataset_name])
+                if dataset_name in request_token_seqs_map
+                else len(flat_seqs)
+            )
+            standard_runs.append({
+                "dataset": dataset_name,
+                "backend": item.get("backend", aggregate.get("backend", default_backend)),
+                "cache_policy": item.get("cache_policy", cache_policy),
+                "order": "default",
+                "repetition": 1,
+                "status": "ok",
+                "metrics": normalize_cache_metrics(
+                    metrics_source,
+                    fallback_total_tokens=dataset_total,
+                    num_requests=item.get("num_requests", request_count),
+                ),
+                "performance": {"elapsed_seconds": item.get("elapsed_seconds")},
+                "details": item,
+            })
+    envelope = make_envelope(
+        experiment_kind="text",
+        script=os.path.basename(__file__),
+        identity=identity,
+        config={**results["config"], **identity_parameters},
+        datasets={
+            name: {
+                **results["dataset_summary"]["per_dataset"][name],
+                "content_sha256": dataset_hashes[name],
+            }
+            for name in args.datasets
+        },
+        runs=standard_runs,
+    )
+    envelope["details"] = {"comparison": results.get("comparison")}
+    write_experiment(envelope, experiment_dir)
+    warnings = write_results_summary(args.output_dir)
+    for warning in warnings:
+        print(f"[WARN] 跳过无法解析的历史结果: {warning}")
+    print_summary(envelope["summary"]["rows"])
+    print(f"\n结果已保存至: {experiment_dir / 'result.json'}")
+    print(f"汇总已更新: {args.output_dir / 'results_report.md'}")
     print("实验完成。")
 
 

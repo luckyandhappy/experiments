@@ -244,8 +244,10 @@ python run_multimodal_experiment.py \
 ```
 
 可用 `--dataset-path chartqa=/custom/path` 和 `--split chartqa=test` 覆盖单个
-数据集设置。结果写入 `results/multimodal/<dataset>/`，根目录的
-`summary.json` 和 `summary.md` 汇总跨数据集结果。
+数据集设置。文本和多模态实验都默认写入 `results/<数据集组合>/<运行指纹>/`：
+`result.json` 使用统一 schema，manifest 和后端日志位于 `artifacts/`。运行指纹
+由数据内容和所有影响结果的参数生成，因此相同数据与参数会更新同一目录，参数
+或数据发生变化则保留为新的实验。可通过 `--output-dir` 修改结果根目录。
 
 视觉缓存的 `potential_hits` 仅表示由重复图片推导出的理论机会；只有后端
 实际暴露的 encoder-cache 计数才会列为实测指标。
@@ -295,11 +297,10 @@ python run_experiment.py \
   --datasets advbench alpaca
 ```
 
-同时指定多个数据集时，每个数据集都会冷启动独立引擎，结果保存在
-`baseline.per_dataset`，避免跨数据集缓存污染。请求严格按 `batch_size`
-分批，上一批完成后才提交下一批。vLLM 结果直接写入 `--output` 指定的 JSON。
-结果中的 `trie` 和 `comparison` 为 `null`，SGLang RadixCache 专属指标同样
-为 `null`。`baseline.metrics` 包含
+同时指定多个数据集时，每个数据集都会冷启动独立引擎，避免跨数据集缓存污染。
+请求严格按 `batch_size` 分批，上一批完成后才提交下一批。文本入口同样使用
+`--output-dir`；旧的 `--output FILE.json` 参数已移除。统一结果的 `runs` 保留
+逐数据集后端详情，`summary.rows` 包含可直接对比的标准缓存指标。后端详情包含
 峰值驻留缓存 token、累计缓存写入 token、命中 token，以及按完整 Prompt
 计算的 Micro/Macro 命中率；`backend_metrics` 另行保留 vLLM 原生的
 query-token 命中率和峰值 KV cache 使用率。

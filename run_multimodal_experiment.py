@@ -16,6 +16,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import run_experiment
+from experiment_results import (
+    build_identity,
+    make_envelope,
+    normalize_cache_metrics,
+    print_summary,
+    result_directory,
+    write_experiment,
+    write_results_summary,
+)
 from scheduler import ScheduledRequest, schedule_heuristic
 from multimodal_experiment import (
     PreparedMultimodalRequest,
@@ -33,7 +42,7 @@ from xxxtrie import XXXTrieNode
 
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_DATA_ROOT = Path("data")
-DEFAULT_OUTPUT_DIR = Path("results/multimodal")
+DEFAULT_OUTPUT_DIR = Path("results")
 
 
 def _max_image_pixels(
@@ -587,7 +596,9 @@ def _parse_overrides(values: Sequence[str], option: str) -> Dict[str, str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="可扩展的多模态缓存性能实验")
+    parser = argparse.ArgumentParser(
+        description="可扩展的多模态缓存性能实验", allow_abbrev=False
+    )
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
     parser.add_argument(
         "--datasets", nargs="+", choices=adapter_names(), default=adapter_names()
@@ -637,50 +648,14 @@ def _dataset_root(args: argparse.Namespace, dataset: str) -> Path:
     return Path(configured) if configured is not None else args.data_root / dataset
 
 
-def _write_cross_dataset_summary(
-    results: Mapping[str, Mapping[str, Any]], output_dir: Path
-) -> None:
-    summary = {
-        dataset: {
-            "manifest": result["manifest"],
-            "experiments": {
-                order: {
-                    backend: value["summary"]
-                    for backend, value in backends.items()
-                }
-                for order, backends in result.get("experiments", {}).items()
-            },
-        }
-        for dataset, result in results.items()
-    }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    lines = [
-        "# Multimodal Cache Experiment Summary",
-        "",
-        "| Dataset | Order | Backend | Successful runs | Median seconds | Median requests/s |",
-        "|---|---|---|---:|---:|---:|",
-    ]
-    for dataset, result in results.items():
-        for order, backends in result.get("experiments", {}).items():
-            for backend, value in backends.items():
-                item = value["summary"]
-                median = item["median"]
-                lines.append(
-                    f"| {dataset} | {order} | {backend} "
-                    f"| {item['num_successful']}/{item['num_runs']} "
-                    f"| {median['elapsed_seconds'] if median['elapsed_seconds'] is not None else 'N/A'} "
-                    f"| {median['requests_per_second'] if median['requests_per_second'] is not None else 'N/A'} |"
-                )
-    (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 async def _run_dataset(
-    args: argparse.Namespace, manifest: Mapping[str, Any], processor: Any
+    args: argparse.Namespace,
+    manifest: Mapping[str, Any],
+    processor: Any,
+    dataset_dir: Path,
 ) -> tuple[Dict[str, Any], bool]:
     dataset = str(manifest["dataset"])
-    dataset_dir = args.output_dir / dataset
+    dataset_dir.mkdir(parents=True, exist_ok=True)
     eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
     result: Dict[str, Any] = {
         "config": {
@@ -696,7 +671,7 @@ async def _run_dataset(
         "manifest": {key: value for key, value in manifest.items() if key != "records"},
         "experiments": {},
     }
-    result_path = dataset_dir / "results.json"
+    result_path = dataset_dir / "backend_runs.json"
     has_errors = False
     order = "grouped"
     samples = manifest_samples(manifest)
@@ -762,8 +737,41 @@ async def _run_dataset(
             result_path.write_text(
                 json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-    _write_report(result, dataset_dir / "report.md")
+    _write_report(result, dataset_dir / "backend_runs.md")
     return result, has_errors
+
+
+def _standard_runs(
+    results: Mapping[str, Mapping[str, Any]]
+) -> List[Dict[str, Any]]:
+    runs: List[Dict[str, Any]] = []
+    for dataset, result in results.items():
+        for order, backends in result.get("experiments", {}).items():
+            for backend, value in backends.items():
+                for repetition, run in enumerate(value.get("runs", []), 1):
+                    status = str(run.get("status", "error"))
+                    cache = run.get("kv_cache", {}) if status == "ok" else {}
+                    runs.append({
+                        "dataset": dataset,
+                        "backend": backend,
+                        "cache_policy": "cstrie" if backend == "cstrie" else "native",
+                        "order": order,
+                        "repetition": repetition,
+                        "status": status,
+                        "metrics": normalize_cache_metrics(
+                            cache,
+                            fallback_total_tokens=run.get("total_prompt_tokens"),
+                            num_requests=run.get("num_requests"),
+                        ),
+                        "performance": {
+                            "elapsed_seconds": run.get("elapsed_seconds"),
+                            "requests_per_second": run.get("requests_per_second"),
+                            "prompt_tokens_per_second": run.get("prompt_tokens_per_second"),
+                            "ttft_proxy": run.get("ttft_proxy"),
+                        },
+                        "details": run,
+                    })
+    return runs
 
 
 async def main() -> None:
@@ -783,37 +791,98 @@ async def main() -> None:
             split,
             args.seed,
         )
-        dataset_dir = args.output_dir / dataset
-        manifest_path = dataset_dir / "manifest.json"
         manifests[dataset] = manifest
+    identity_parameters = {
+        "experiment_kind": "multimodal",
+        "model_path": str(Path(args.model_path).expanduser().resolve()),
+        "batch_size": args.batch_size,
+        "context_length": args.context_length,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "seed": args.seed,
+        "repetitions": args.repetitions,
+        "orders": ["grouped"],
+        "backends": sorted(args.backends),
+        "splits": {
+            dataset: args.splits.get(dataset, get_adapter(dataset).default_split)
+            for dataset in args.datasets
+        },
+        "vllm_block_size": run_experiment.VLLM_BLOCK_SIZE if "vllm" in args.backends else None,
+    }
+    identity = build_identity(
+        {dataset: manifest["records_sha256"] for dataset, manifest in manifests.items()},
+        identity_parameters,
+    )
+    experiment_dir = result_directory(args.output_dir, identity)
+    artifacts_dir = experiment_dir / "artifacts"
+    for dataset, manifest in manifests.items():
+        manifest_path = artifacts_dir / dataset / "manifest.json"
         write_manifest(manifest, manifest_path)
         print(
             f"[DATA] {dataset}: {manifest['num_media']} media, "
             f"{manifest['num_samples']} samples -> {manifest_path}"
         )
+    dataset_metadata = {
+        dataset: {key: value for key, value in manifest.items() if key != "records"}
+        for dataset, manifest in manifests.items()
+    }
+    envelope = make_envelope(
+        experiment_kind="multimodal",
+        script=Path(__file__).name,
+        identity=identity,
+        config=identity_parameters,
+        datasets=dataset_metadata,
+        runs=[],
+        status="prepared",
+    )
+    write_experiment(envelope, experiment_dir)
+    write_results_summary(args.output_dir)
     if args.prepare_only:
-        prepared = {
-            dataset: {
-                key: value for key, value in manifest.items() if key != "records"
-            }
-            for dataset, manifest in manifests.items()
-        }
-        (args.output_dir / "summary.json").write_text(
-            json.dumps(prepared, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        print(f"[DONE] {experiment_dir / 'result.json'}")
         return
 
     processor = load_processor(args.model_path)
     results: Dict[str, Dict[str, Any]] = {}
     has_errors = False
     for dataset in args.datasets:
-        result, dataset_has_errors = await _run_dataset(
-            args, manifests[dataset], processor
-        )
+        dataset_artifacts = artifacts_dir / dataset
+        try:
+            result, dataset_has_errors = await _run_dataset(
+                args, manifests[dataset], processor, dataset_artifacts
+            )
+        except Exception:
+            partial_path = dataset_artifacts / "backend_runs.json"
+            if partial_path.is_file():
+                results[dataset] = json.loads(partial_path.read_text(encoding="utf-8"))
+            envelope = make_envelope(
+                experiment_kind="multimodal",
+                script=Path(__file__).name,
+                identity=identity,
+                config=identity_parameters,
+                datasets=dataset_metadata,
+                runs=_standard_runs(results),
+                status="failed",
+            )
+            write_experiment(envelope, experiment_dir)
+            write_results_summary(args.output_dir)
+            raise
         results[dataset] = result
         has_errors = has_errors or dataset_has_errors
-        _write_cross_dataset_summary(results, args.output_dir)
-    print(f"[DONE] {args.output_dir / 'summary.json'}")
+        envelope = make_envelope(
+            experiment_kind="multimodal",
+            script=Path(__file__).name,
+            identity=identity,
+            config=identity_parameters,
+            datasets=dataset_metadata,
+            runs=_standard_runs(results),
+            status="partial" if has_errors else "completed",
+        )
+        write_experiment(envelope, experiment_dir)
+    warnings = write_results_summary(args.output_dir)
+    for warning in warnings:
+        print(f"[WARN] 跳过无法解析的历史结果: {warning}")
+    print_summary(envelope["summary"]["rows"])
+    print(f"[DONE] {experiment_dir / 'result.json'}")
+    print(f"[DONE] {args.output_dir / 'results_report.md'}")
     if has_errors:
         raise SystemExit(1)
 
