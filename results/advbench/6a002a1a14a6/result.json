@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "run_id": "6a002a1a14a6",
+  "created_at": "2026-08-17T16:37:23+08:00",
+  "experiment": {
+    "kind": "text",
+    "script": "run_experiment.py",
+    "status": "completed"
+  },
+  "identity": {
+    "dataset_key": "advbench",
+    "datasets": [
+      {
+        "name": "advbench",
+        "content_sha256": "4fcfec7563833eb36dbbc1c098271f4513fa8ddd4397b6a615e89d35b553cd01"
+      }
+    ],
+    "parameters_sha256": "aa34686e58c7668343442b792754778f48088114edf18a7085ef4e889b61c215",
+    "full_sha256": "6a002a1a14a6b18fb954e74c82e39f8657c42807b0e85a3fd1d0e0717198979f",
+    "run_id": "6a002a1a14a6"
+  },
+  "config": {
+    "backend": "vllm",
+    "model_path": "/home/mp/Projects/newcache/Qwen3-8B",
+    "datasets": [
+      "advbench"
+    ],
+    "data_dir": "/home/mp/Projects/newcache/data",
+    "context_length": 4096,
+    "batch_size": 8,
+    "max_input_tokens": 1024,
+    "gpu_memory_utilization": 0.8,
+    "experiment_kind": "text",
+    "scheduler": [
+      "heuristic",
+      "dfs",
+      "bfs"
+    ],
+    "run_baseline": true,
+    "run_cstrie": false,
+    "vllm_block_size": 16,
+    "sglang_page_size": null
+  },
+  "datasets": {
+    "advbench": {
+      "num_samples": 520,
+      "total_tokens": 6668,
+      "prefix_opportunities": {
+        "sglang_native_1_token": {
+          "match_unit_tokens": 1,
+          "eligible_requests": 520,
+          "requests_with_opportunity": 481,
+          "potential_hit_tokens": 2221,
+          "potential_micro_hit_rate": 0.3330833833233353,
+          "potential_micro_hit_rate_percent": 33.308338332333534
+        },
+        "vllm_native_16_token": {
+          "match_unit_tokens": 16,
+          "eligible_requests": 54,
+          "requests_with_opportunity": 0,
+          "potential_hit_tokens": 0,
+          "potential_micro_hit_rate": 0.0,
+          "potential_micro_hit_rate_percent": 0.0
+        }
+      },
+      "content_sha256": "4fcfec7563833eb36dbbc1c098271f4513fa8ddd4397b6a615e89d35b553cd01"
+    }
+  },
+  "runs": [
+    {
+      "dataset": "advbench",
+      "backend": "vllm",
+      "cache_policy": "native",
+      "order": "default",
+      "repetition": 1,
+      "status": "ok",
+      "metrics": {
+        "total_tokens": 6668,
+        "hit_tokens": 0,
+        "peak_cache_tokens": 0,
+        "peak_cache_bytes": null,
+        "peak_cache_mib": null,
+        "micro_hit_rate": 0.0,
+        "macro_hit_rate": 0.0,
+        "num_requests": 520
+      },
+      "performance": {
+        "elapsed_seconds": 14.581001043319702
+      },
+      "details": {
+        "backend": "vllm",
+        "backend_version": "0.26.0",
+        "cache_policy": "native",
+        "cache_match_mode": "block",
+        "block_size": 16,
+        "cache_granularity_tokens": 16,
+        "sampler_backend": "native",
+        "flashinfer_sampler_enabled": false,
+        "model_runner": "v1",
+        "async_scheduling": false,
+        "tokenizers_parallelism": false,
+        "cache_self_test": {
+          "passed": true,
+          "expected_min_hit_tokens": 16,
+          "observed_hit_tokens": 16,
+          "first_request_cached_tokens": 0
+        },
+        "elapsed_seconds": 14.581001043319702,
+        "num_requests": 520,
+        "requests_per_second": 35.66284636117206,
+        "input_tokens_per_second": 457.3074221851832,
+        "metrics": {
+          "prefill_hit": null,
+          "peak_full_tokens": 0,
+          "peak_radix_bytes": null,
+          "peak_radix_kib": null,
+          "peak_radix_mib": null,
+          "cache_capacity_tokens": 23712,
+          "peak_cache_tokens": 0,
+          "cache_capacity_bytes": null,
+          "peak_cache_bytes": null,
+          "peak_cache_kib": null,
+          "peak_cache_mib": null,
+          "cache_bytes_available": false,
+          "cache_creation_tokens": 1424,
+          "cache_hit_tokens": 0,
+          "aggregate_hit_rate_micro": 0.0,
+          "aggregate_hit_rate_micro_percent": 0.0,
+          "aggregate_hit_rate_macro": 0.0,
+          "aggregate_hit_rate_macro_percent": 0.0,
+          "total_input_tokens_measured": 6668,
+          "total_hit_tokens_measured": 0,
+          "backend_metrics": {
+            "prefix_cache_query_tokens": 6668,
+            "prefix_cache_hit_tokens": 0,
+            "native_micro_hit_rate": 0.0,
+            "native_micro_hit_rate_percent": 0.0,
+            "peak_kv_cache_usage": 0.0,
+            "peak_kv_cache_usage_percent": 0.0,
+            "missing_num_cached_tokens": 0,
+            "missing_num_cache_creation_tokens": 0
+          }
+        }
+      }
+    }
+  ],
+  "summary": {
+    "rows": [
+      {
+        "dataset": "advbench",
+        "backend": "vllm",
+        "cache_policy": "native",
+        "order": "default",
+        "status": "ok",
+        "successful_runs": 1,
+        "total_runs": 1,
+        "total_tokens": 6668,
+        "hit_tokens": 0,
+        "peak_cache_tokens": 0,
+        "peak_cache_bytes": null,
+        "peak_cache_mib": null,
+        "micro_hit_rate": 0.0,
+        "macro_hit_rate": 0.0
+      }
+    ]
+  },
+  "details": {
+    "comparison": null
+  }
+}

@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "run_id": "5a09f986e081",
+  "created_at": "2026-08-17T16:43:38+08:00",
+  "experiment": {
+    "kind": "text",
+    "script": "run_experiment.py",
+    "status": "completed"
+  },
+  "identity": {
+    "dataset_key": "squad",
+    "datasets": [
+      {
+        "name": "squad",
+        "content_sha256": "f19a5daacbdf07ed01209b6ff4ad5b64d7b2c94d6fcb51e1c22c9c839cdc5761"
+      }
+    ],
+    "parameters_sha256": "aa34686e58c7668343442b792754778f48088114edf18a7085ef4e889b61c215",
+    "full_sha256": "5a09f986e081cac0c522b9f13d17fdd4f9ac9ee422047a480315568ebb36421e",
+    "run_id": "5a09f986e081"
+  },
+  "config": {
+    "backend": "vllm",
+    "model_path": "/home/mp/Projects/newcache/Qwen3-8B",
+    "datasets": [
+      "squad"
+    ],
+    "data_dir": "/home/mp/Projects/newcache/data",
+    "context_length": 4096,
+    "batch_size": 8,
+    "max_input_tokens": 1024,
+    "gpu_memory_utilization": 0.8,
+    "experiment_kind": "text",
+    "scheduler": [
+      "heuristic",
+      "dfs",
+      "bfs"
+    ],
+    "run_baseline": true,
+    "run_cstrie": false,
+    "vllm_block_size": 16,
+    "sglang_page_size": null
+  },
+  "datasets": {
+    "squad": {
+      "num_samples": 10570,
+      "total_tokens": 1972761,
+      "prefix_opportunities": {
+        "sglang_native_1_token": {
+          "match_unit_tokens": 1,
+          "eligible_requests": 10570,
+          "requests_with_opportunity": 10562,
+          "potential_hit_tokens": 576349,
+          "potential_micro_hit_rate": 0.2921534843805205,
+          "potential_micro_hit_rate_percent": 29.215348438052054
+        },
+        "vllm_native_16_token": {
+          "match_unit_tokens": 16,
+          "eligible_requests": 10570,
+          "requests_with_opportunity": 3197,
+          "potential_hit_tokens": 527024,
+          "potential_micro_hit_rate": 0.267150455630459,
+          "potential_micro_hit_rate_percent": 26.7150455630459
+        }
+      },
+      "content_sha256": "f19a5daacbdf07ed01209b6ff4ad5b64d7b2c94d6fcb51e1c22c9c839cdc5761"
+    }
+  },
+  "runs": [
+    {
+      "dataset": "squad",
+      "backend": "vllm",
+      "cache_policy": "native",
+      "order": "default",
+      "repetition": 1,
+      "status": "ok",
+      "metrics": {
+        "total_tokens": 1972761,
+        "hit_tokens": 1408688,
+        "peak_cache_tokens": 0,
+        "peak_cache_bytes": null,
+        "peak_cache_mib": null,
+        "micro_hit_rate": 0.7140692663733721,
+        "macro_hit_rate": 0.6993860169393209,
+        "num_requests": 10570
+      },
+      "performance": {
+        "elapsed_seconds": 99.28675603866577
+      },
+      "details": {
+        "backend": "vllm",
+        "backend_version": "0.26.0",
+        "cache_policy": "native",
+        "cache_match_mode": "block",
+        "block_size": 16,
+        "cache_granularity_tokens": 16,
+        "sampler_backend": "native",
+        "flashinfer_sampler_enabled": false,
+        "model_runner": "v1",
+        "async_scheduling": false,
+        "tokenizers_parallelism": false,
+        "cache_self_test": {
+          "passed": true,
+          "expected_min_hit_tokens": 16,
+          "observed_hit_tokens": 16,
+          "first_request_cached_tokens": 0
+        },
+        "elapsed_seconds": 99.28675603866577,
+        "num_requests": 10570,
+        "requests_per_second": 106.45931463289695,
+        "input_tokens_per_second": 19869.32677336882,
+        "metrics": {
+          "prefill_hit": null,
+          "peak_full_tokens": 0,
+          "peak_radix_bytes": null,
+          "peak_radix_kib": null,
+          "peak_radix_mib": null,
+          "cache_capacity_tokens": 23712,
+          "peak_cache_tokens": 0,
+          "cache_capacity_bytes": null,
+          "peak_cache_bytes": null,
+          "peak_cache_kib": null,
+          "peak_cache_mib": null,
+          "cache_bytes_available": false,
+          "cache_creation_tokens": 484960,
+          "cache_hit_tokens": 1408688,
+          "aggregate_hit_rate_micro": 0.7140692663733721,
+          "aggregate_hit_rate_micro_percent": 71.40692663733721,
+          "aggregate_hit_rate_macro": 0.6993860169393209,
+          "aggregate_hit_rate_macro_percent": 69.93860169393209,
+          "total_input_tokens_measured": 1972761,
+          "total_hit_tokens_measured": 1408688,
+          "backend_metrics": {
+            "prefix_cache_query_tokens": 1972761,
+            "prefix_cache_hit_tokens": 1408688,
+            "native_micro_hit_rate": 0.7140692663733721,
+            "native_micro_hit_rate_percent": 71.40692663733721,
+            "peak_kv_cache_usage": 0.0,
+            "peak_kv_cache_usage_percent": 0.0,
+            "missing_num_cached_tokens": 0,
+            "missing_num_cache_creation_tokens": 0
+          }
+        }
+      }
+    }
+  ],
+  "summary": {
+    "rows": [
+      {
+        "dataset": "squad",
+        "backend": "vllm",
+        "cache_policy": "native",
+        "order": "default",
+        "status": "ok",
+        "successful_runs": 1,
+        "total_runs": 1,
+        "total_tokens": 1972761,
+        "hit_tokens": 1408688,
+        "peak_cache_tokens": 0,
+        "peak_cache_bytes": null,
+        "peak_cache_mib": null,
+        "micro_hit_rate": 0.7140692663733721,
+        "macro_hit_rate": 0.6993860169393209
+      }
+    ]
+  },
+  "details": {
+    "comparison": null
+  }
+}
