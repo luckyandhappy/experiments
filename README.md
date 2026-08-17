@@ -229,9 +229,10 @@ python run_multimodal_experiment.py \
   --prepare-only
 ```
 
-VQAv2 与 ChartQA 默认抽取 200 张图片并保留这些图片的全部问题；MME 默认
-运行全部 14 个子任务。显式传入 `--num-media` 时，MME 会按子任务分层抽样。
-正式实验默认运行 grouped/shuffled 两种顺序、三个后端和三次冷启动：
+所有数据集使用固定的 10,000 张媒体上限：媒体总数不超过上限时全量运行；
+超过上限时按 `--seed` 确定性抽取 10,000 张，并保留这些媒体关联的全部问题。
+`--num-media` 和 shuffled 顺序已移除，正式实验只运行 grouped 顺序；默认对
+三个后端分别进行三次冷启动：
 
 ```bash
 python run_multimodal_experiment.py \
@@ -252,6 +253,21 @@ SGLang 指标日志可使用逐请求字段 `encoder_cache_hit`，或累计字�
 `encoder_cache_hits`、`encoder_cache_misses`、`encoder_cache_entries` 和
 `encoder_cache_capacity_embeddings`；脚本会自动识别并归一化。
 
+多模态 vLLM 基线与文本基线使用相同原生缓存契约：vLLM 0.26.x、
+`block_size=16`、原生逐 block APC，不设置 `prefix_match_unit`，并设置
+`VLLM_USE_FLASHINFER_SAMPLER=0`。每次冷启动后先用重复请求验证至少一个完整
+16-token block 命中，再清空 prefix cache 后运行正式请求。图片按 batch 加载
+并在该批完成后释放，避免 10,000 张媒体的解码对象同时驻留主存。启动时仅用
+单图输入并关闭未使用的 video modality。为规避 vLLM 0.26 在 Qwen3-VL encoder
+memory profiling 阶段的已知挂起，启用原生 `skip_mm_profiling`；它不缩放真实
+测试图片。同时通过 `VLLM_USE_V2_MODEL_RUNNER=0` 使用 vLLM 官方 V1 兼容路径，
+并关闭 Qwen3-VL 已知不稳定的 asynchronous scheduling；这些设置不改变原生逐
+block APC。真实最大图片像素和这些兼容开关都会写入结果元数据。
+在加载 Processor 之前还会设置 `TOKENIZERS_PARALLELISM=false`，避免 fast
+tokenizer 线程池先于 EngineCore 创建而导致多进程 pinned-memory 初始化死锁。
+多模态 vLLM 还会先完成引擎启动和 APC 自检，再惰性构造正式请求；同时选择多个
+后端时也会优先运行 vLLM，避免其他后端提前初始化 tokenizer 或 CUDA 状态。
+
 #### 运行原生推理框架基线
 
 `run_experiment.py` 支持两种互斥的运行模式：
@@ -267,9 +283,9 @@ python run_experiment.py --backend vllm
 vLLM 模式要求 `vllm>=0.26.0,<0.27.0`，使用进程内异步引擎和 token ID
 输入，并开启原生 prefix caching。该模式不会导入或启动 SGLang，不会构建
 CSTrie，也不会执行调度器。可通过 `--gpu-memory-utilization` 调整引擎可用的
-GPU 显存比例。CUDA attention backend 不支持 2-token 的物理 KV block，因此
-物理 `block_size` 使用 vLLM 默认支持的 16 tokens，并设置
-`prefix_match_unit=2`，使 APC 能以 2-token 边界进行前缀匹配。例如：
+GPU 显存比例。CUDA attention backend 的物理 KV block 必须是 16 的倍数，
+实验使用官方支持的最小值 `block_size=16`，并保留 vLLM 原生逐 block 匹配；
+不再设置对 Qwen3 单一 KV-cache group 无效的 `prefix_match_unit`。例如：
 
 ```bash
 python run_experiment.py \
@@ -279,11 +295,25 @@ python run_experiment.py \
   --datasets advbench alpaca
 ```
 
-vLLM 结果直接写入 `--output` 指定的 JSON。结果中的 `trie` 和 `comparison`
-为 `null`，SGLang RadixCache 专属指标同样为 `null`。`baseline.metrics` 包含
+同时指定多个数据集时，每个数据集都会冷启动独立引擎，结果保存在
+`baseline.per_dataset`，避免跨数据集缓存污染。请求严格按 `batch_size`
+分批，上一批完成后才提交下一批。vLLM 结果直接写入 `--output` 指定的 JSON。
+结果中的 `trie` 和 `comparison` 为 `null`，SGLang RadixCache 专属指标同样
+为 `null`。`baseline.metrics` 包含
 峰值驻留缓存 token、累计缓存写入 token、命中 token，以及按完整 Prompt
 计算的 Micro/Macro 命中率；`backend_metrics` 另行保留 vLLM 原生的
 query-token 命中率和峰值 KV cache 使用率。
+
+脚本在导入 vLLM 前固定设置 `VLLM_USE_FLASHINFER_SAMPLER=0`，使用 vLLM
+原生 PyTorch/Triton sampler。这避免 FlashInfer 0.6.14 sampling JIT 与其
+CCCL/CUB 3.x 头文件不兼容导致的 `FlagHeads` 编译错误。该设置只改变输出
+token 的采样实现，不影响 KV cache、16-token block 匹配或 APC 命中统计；
+结果中记录 `sampler_backend=native` 和 `flashinfer_sampler_enabled=false`。
+
+正式数据前会用重复的完整 16-token block 验证 APC，并在自检后清空缓存。
+结果会记录 `cache_match_mode=block`、`cache_granularity_tokens=16`，以及逐
+token 和 16-token 粒度下的理论前缀复用机会。SGLang 原生基线保持默认的
+逐 token RadixCache，因此两个原生后端的命中率不要求相同。
 
 缓存 token 容量来自 vLLM `cache_config_info` 中 group-aware 的
 `kv_cache_size_tokens`。当自动显存分配没有暴露 `kv_cache_memory_bytes` 时，

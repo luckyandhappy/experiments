@@ -50,7 +50,9 @@ _MODEL_PATH = os.path.join(
 )
 
 # 数据集目录
-_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+)
 
 # 实验输出目录
 _EXPERIMENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,7 +69,7 @@ GPU_MEMORY_UTILIZATION = 0.8
 VLLM_MIN_VERSION = (0, 26)
 VLLM_MAX_VERSION = (0, 27)
 VLLM_BLOCK_SIZE = 16
-VLLM_PREFIX_MATCH_UNIT = 2
+SGLANG_PAGE_SIZE = 1
 
 # 用于标明跳过 RadixCache 写入的 bootstrap_host 占位值
 _FAKE_BOOTSTRAP_HOST = "2.2.2.2"
@@ -184,6 +186,51 @@ def compute_total_tokens(
         sum(len(seq) for seq in seqs)
         for seqs in request_token_seqs_map.values()
     )
+
+
+def analyze_prefix_opportunities(
+    seqs: List[List[int]],
+    match_unit: int,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """按严格批次时序估算指定匹配粒度下、容量无限时的最大可命中量。"""
+    cached_prefixes: Set[Tuple[int, ...]] = set()
+    total_tokens = sum(len(seq) for seq in seqs)
+    hit_tokens = 0
+    hit_requests = 0
+    eligible_requests = sum(max(len(seq) - 1, 0) >= match_unit for seq in seqs)
+
+    for start in range(0, len(seqs), batch_size):
+        batch = seqs[start : start + batch_size]
+        for seq in batch:
+            hit = 0
+            max_hit = max(len(seq) - 1, 0)
+            for end in range(match_unit, max_hit + 1, match_unit):
+                if tuple(seq[:end]) not in cached_prefixes:
+                    break
+                hit = end
+            hit_tokens += hit
+            hit_requests += hit > 0
+        # 同一批并发请求不能使用本批才产生的缓存。
+        for seq in batch:
+            for end in range(match_unit, len(seq) + 1, match_unit):
+                cached_prefixes.add(tuple(seq[:end]))
+
+    return {
+        "match_unit_tokens": match_unit,
+        "eligible_requests": eligible_requests,
+        "requests_with_opportunity": hit_requests,
+        "potential_hit_tokens": hit_tokens,
+        "potential_micro_hit_rate": hit_tokens / total_tokens if total_tokens else 0.0,
+        "potential_micro_hit_rate_percent": (
+            hit_tokens / total_tokens * 100.0 if total_tokens else 0.0
+        ),
+    }
+
+
+def _dataset_metrics_path(path: str, dataset_name: str) -> str:
+    stem, suffix = os.path.splitext(path)
+    return f"{stem}.{dataset_name}{suffix or '.jsonl'}"
 
 
 # ============================================================
@@ -386,8 +433,64 @@ async def _send_requests_baseline(
             except Exception as exc:
                 print(f"[BASELINE] 请求 {sgl_rid} 失败: {exc}")
 
-    tasks = [_run_one(rid, seq) for rid, seq in flat_seqs]
-    await asyncio.gather(*tasks)
+    # 严格按 batch_size 划分批次。只有上一批全部完成后才提交下一批，
+    # 避免后端内部排队深度不同导致缓存可见时序不一致。
+    for start in range(0, len(flat_seqs), batch_size):
+        batch = flat_seqs[start : start + batch_size]
+        await asyncio.gather(*(_run_one(rid, seq) for rid, seq in batch))
+
+
+async def _run_sglang_cache_self_test(
+    llm: Any,
+    metrics_log_path: str,
+    tokenizer_eos_id: int,
+) -> Dict[str, Any]:
+    """验证 SGLang 原生逐 token RadixCache，并清除自检数据。"""
+    probe = [tokenizer_eos_id] * 4
+    sampling_params = {
+        "max_new_tokens": 1,
+        "temperature": 0.0,
+        "stop_token_ids": [tokenizer_eos_id],
+        "skip_special_tokens": True,
+    }
+    for index in range(2):
+        await llm.async_generate(
+            input_ids=probe,
+            sampling_params=sampling_params,
+            stream=False,
+            rid=f"__sglang_cache_self_test__:{index}",
+        )
+
+    observed_hit = 0
+    if os.path.exists(metrics_log_path):
+        with open(metrics_log_path, "r", encoding="utf-8") as metrics_file:
+            for line in metrics_file:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("rid") == "__sglang_cache_self_test__:1":
+                    observed_hit = int(
+                        event.get("prefix_cache_hit_token_count", 0)
+                    )
+    if observed_hit < SGLANG_PAGE_SIZE:
+        raise RuntimeError(
+            "SGLang 原生 RadixCache 自检失败: "
+            f"重复请求命中 {observed_hit} tokens"
+        )
+
+    flush_result = llm.flush_cache()
+    if inspect.isawaitable(flush_result):
+        flush_result = await flush_result
+    if flush_result is False:
+        raise RuntimeError("SGLang RadixCache 自检后清空缓存失败")
+    if os.path.exists(metrics_log_path):
+        os.remove(metrics_log_path)
+    return {
+        "passed": True,
+        "expected_min_hit_tokens": SGLANG_PAGE_SIZE,
+        "observed_hit_tokens": observed_hit,
+    }
 
 
 # ============================================================
@@ -443,6 +546,7 @@ async def run_baseline_experiment(
         dtype="auto",
         context_length=config.context_length,
         max_running_requests=max(config.batch_size, 4),
+        page_size=SGLANG_PAGE_SIZE,
         chunked_prefill_size=256,
         disable_cuda_graph=True,
         disable_radix_cache=False,
@@ -452,6 +556,12 @@ async def run_baseline_experiment(
     )
 
     try:
+        print("[BASELINE] 验证 SGLang 原生 token RadixCache ...")
+        cache_self_test = await _run_sglang_cache_self_test(
+            llm,
+            config.metrics_log_path,
+            tokenizer.eos_token_id,
+        )
         print("[BASELINE] 发送请求 (无缓存策略干预) ...")
         await _send_requests_baseline(
             llm=llm,
@@ -470,6 +580,7 @@ async def run_baseline_experiment(
     return {
         "elapsed_seconds": elapsed,
         "num_requests": len(flat_seqs),
+        "cache_self_test": cache_self_test,
     }
 
 
@@ -494,6 +605,18 @@ def validate_vllm_version(version: Optional[str] = None) -> str:
     return version
 
 
+def _configure_vllm_native_runtime() -> None:
+    """Configure the reproducible native sampler before importing vLLM."""
+    # Fast-tokenizer worker pools created before EngineCore's process can
+    # deadlock the child during pinned-memory setup.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+    # vLLM 0.26 defaults non-MoE models to Model Runner V2. Qwen3-VL can
+    # deadlock there immediately after loading weights; V1 is the supported
+    # compatibility path and uses the same native block APC implementation.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
+
 @dataclass(frozen=True)
 class _VLLMMetricSnapshot:
     """vLLM 数值指标和 Info 指标中携带的缓存配置。"""
@@ -512,6 +635,51 @@ class _VLLMRequestMetrics:
     cache_creation_tokens: int
     missing_cached_tokens: bool
     missing_cache_creation_tokens: bool
+
+
+async def _run_vllm_apc_self_test(
+    llm: Any,
+    sampling_params_cls: Any,
+    tokenizer_eos_id: int,
+) -> Dict[str, Any]:
+    """验证原生 APC 能命中一个完整物理 block，并在测试后清空缓存。"""
+    probe = [tokenizer_eos_id] * (VLLM_BLOCK_SIZE + 2)
+    first = await _send_requests_vllm(
+        llm,
+        sampling_params_cls,
+        [(('__apc_self_test__', 0), probe)],
+        tokenizer_eos_id,
+        batch_size=1,
+    )
+    second = await _send_requests_vllm(
+        llm,
+        sampling_params_cls,
+        [(('__apc_self_test__', 1), probe)],
+        tokenizer_eos_id,
+        batch_size=1,
+    )
+    hit_tokens = second[0].cached_tokens
+    passed = hit_tokens >= VLLM_BLOCK_SIZE
+
+    reset = getattr(llm, "reset_prefix_cache", None)
+    if reset is None:
+        raise RuntimeError("vLLM AsyncLLMEngine 缺少 reset_prefix_cache，无法隔离自检缓存")
+    reset_result = reset()
+    if inspect.isawaitable(reset_result):
+        reset_result = await reset_result
+    if reset_result is False:
+        raise RuntimeError("vLLM prefix cache 自检后清空缓存失败")
+    if not passed:
+        raise RuntimeError(
+            "vLLM 原生 APC 自检失败: "
+            f"重复请求仅命中 {hit_tokens} tokens，期望至少 {VLLM_BLOCK_SIZE}"
+        )
+    return {
+        "passed": True,
+        "expected_min_hit_tokens": VLLM_BLOCK_SIZE,
+        "observed_hit_tokens": hit_tokens,
+        "first_request_cached_tokens": first[0].cached_tokens,
+    }
 
 
 def _read_vllm_metric_snapshot() -> _VLLMMetricSnapshot:
@@ -652,9 +820,13 @@ async def _send_requests_vllm(
                 missing_cache_creation_tokens=creation_value is None,
             )
 
-    return list(
-        await asyncio.gather(*(run_one(rid, seq) for rid, seq in flat_seqs))
-    )
+    results: List[_VLLMRequestMetrics] = []
+    for start in range(0, len(flat_seqs), batch_size):
+        batch = flat_seqs[start : start + batch_size]
+        results.extend(
+            await asyncio.gather(*(run_one(rid, seq) for rid, seq in batch))
+        )
+    return results
 
 
 async def run_vllm_baseline_experiment(
@@ -662,6 +834,11 @@ async def run_vllm_baseline_experiment(
     flat_seqs: List[Tuple[RequestID, List[int]]],
 ) -> Dict[str, Any]:
     """执行 vLLM 0.26.x 原生 Automatic Prefix Caching 基线。"""
+    # FlashInfer 0.6.14 的 sampling JIT 与其打包的 CCCL/CUB 3.x 不兼容，
+    # 会在 EngineCore warmup 阶段因 FlagHeads API 缺失而编译失败。缓存实验只需
+    # 确定性 greedy sampling，因此固定使用 vLLM 官方的原生 sampler 路径。
+    # 必须在导入 vLLM 和创建 EngineCore 子进程前设置，子进程才能继承该配置。
+    _configure_vllm_native_runtime()
     version = validate_vllm_version()
     try:
         vllm = importlib.import_module("vllm")
@@ -680,7 +857,8 @@ async def run_vllm_baseline_experiment(
     print(f"  上下文长度: {config.context_length}")
     print(f"  批大小: {config.batch_size}")
     print(f"  KV cache physical block size: {VLLM_BLOCK_SIZE} tokens")
-    print(f"  Prefix match unit: {VLLM_PREFIX_MATCH_UNIT} tokens")
+    print(f"  Prefix match mode: native block ({VLLM_BLOCK_SIZE} tokens)")
+    print("  Sampler backend: vLLM native (FlashInfer sampler disabled)")
     print(f"  请求总数: {len(flat_seqs)}")
 
     t0 = time.time()
@@ -697,8 +875,8 @@ async def run_vllm_baseline_experiment(
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.context_length,
         max_num_seqs=config.batch_size,
+        async_scheduling=False,
         block_size=VLLM_BLOCK_SIZE,
-        prefix_match_unit=VLLM_PREFIX_MATCH_UNIT,
         enable_prefix_caching=True,
         trust_remote_code=True,
         dtype="auto",
@@ -707,6 +885,18 @@ async def run_vllm_baseline_experiment(
     )
     print("[BASELINE] 启动 vLLM AsyncLLMEngine ...")
     llm = async_engine_cls.from_engine_args(engine_args)
+    print("[BASELINE] 验证 vLLM 原生 block APC ...")
+    try:
+        cache_self_test = await _run_vllm_apc_self_test(
+            llm,
+            sampling_params_cls,
+            tokenizer.eos_token_id,
+        )
+    except Exception:
+        shutdown_result = llm.shutdown()
+        if inspect.isawaitable(shutdown_result):
+            await shutdown_result
+        raise
     before = _read_vllm_metric_snapshot()
     peak_kv_usage = _metric_value(before, "kv_cache_usage_perc")
     stop_sampling = asyncio.Event()
@@ -863,13 +1053,110 @@ async def run_vllm_baseline_experiment(
     return {
         "backend": "vllm",
         "backend_version": version,
+        "cache_policy": "native",
+        "cache_match_mode": "block",
         "block_size": VLLM_BLOCK_SIZE,
-        "prefix_match_unit": VLLM_PREFIX_MATCH_UNIT,
+        "cache_granularity_tokens": VLLM_BLOCK_SIZE,
+        "sampler_backend": "native",
+        "flashinfer_sampler_enabled": False,
+        "model_runner": "v1",
+        "async_scheduling": False,
+        "tokenizers_parallelism": False,
+        "cache_self_test": cache_self_test,
         "elapsed_seconds": elapsed,
         "num_requests": len(flat_seqs),
         "requests_per_second": len(flat_seqs) / elapsed if elapsed else 0.0,
         "input_tokens_per_second": total_input_tokens / elapsed if elapsed else 0.0,
         "metrics": metrics,
+    }
+
+
+def aggregate_vllm_baselines(
+    per_dataset: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """汇总逐数据集冷启动的 vLLM 结果，同时保留每次原始结果。"""
+    if not per_dataset:
+        raise ValueError("至少需要一个 vLLM 数据集结果")
+    runs = list(per_dataset.values())
+    metrics_list = [run["metrics"] for run in runs]
+    num_requests = sum(run["num_requests"] for run in runs)
+    elapsed = sum(run["elapsed_seconds"] for run in runs)
+    total_input = sum(m["total_input_tokens_measured"] for m in metrics_list)
+    total_hits = sum(m["total_hit_tokens_measured"] for m in metrics_list)
+    cache_queries = sum(
+        m["backend_metrics"]["prefix_cache_query_tokens"] for m in metrics_list
+    )
+    cache_hits = sum(
+        m["backend_metrics"]["prefix_cache_hit_tokens"] for m in metrics_list
+    )
+
+    def max_optional(key: str) -> Optional[float]:
+        values = [m[key] for m in metrics_list if m.get(key) is not None]
+        return max(values) if values else None
+
+    macro = (
+        sum(
+            m["aggregate_hit_rate_macro"] * run["num_requests"]
+            for run, m in zip(runs, metrics_list)
+        )
+        / num_requests
+        if num_requests
+        else 0.0
+    )
+    micro = total_hits / total_input if total_input else 0.0
+    native = cache_hits / cache_queries if cache_queries else 0.0
+    first = runs[0]
+    metrics = {
+        **metrics_list[0],
+        "peak_full_tokens": max_optional("peak_full_tokens"),
+        "cache_capacity_tokens": max_optional("cache_capacity_tokens"),
+        "peak_cache_tokens": max_optional("peak_cache_tokens"),
+        "cache_capacity_bytes": max_optional("cache_capacity_bytes"),
+        "peak_cache_bytes": max_optional("peak_cache_bytes"),
+        "peak_cache_kib": max_optional("peak_cache_kib"),
+        "peak_cache_mib": max_optional("peak_cache_mib"),
+        "cache_bytes_available": all(
+            m["cache_bytes_available"] for m in metrics_list
+        ),
+        "cache_creation_tokens": sum(m["cache_creation_tokens"] for m in metrics_list),
+        "cache_hit_tokens": total_hits,
+        "aggregate_hit_rate_micro": micro,
+        "aggregate_hit_rate_micro_percent": micro * 100.0,
+        "aggregate_hit_rate_macro": macro,
+        "aggregate_hit_rate_macro_percent": macro * 100.0,
+        "total_input_tokens_measured": total_input,
+        "total_hit_tokens_measured": total_hits,
+        "backend_metrics": {
+            **metrics_list[0]["backend_metrics"],
+            "prefix_cache_query_tokens": cache_queries,
+            "prefix_cache_hit_tokens": cache_hits,
+            "native_micro_hit_rate": native,
+            "native_micro_hit_rate_percent": native * 100.0,
+            "peak_kv_cache_usage": max(
+                m["backend_metrics"]["peak_kv_cache_usage"] for m in metrics_list
+            ),
+            "peak_kv_cache_usage_percent": max(
+                m["backend_metrics"]["peak_kv_cache_usage_percent"]
+                for m in metrics_list
+            ),
+            "missing_num_cached_tokens": sum(
+                m["backend_metrics"]["missing_num_cached_tokens"]
+                for m in metrics_list
+            ),
+            "missing_num_cache_creation_tokens": sum(
+                m["backend_metrics"]["missing_num_cache_creation_tokens"]
+                for m in metrics_list
+            ),
+        },
+    }
+    return {
+        **first,
+        "elapsed_seconds": elapsed,
+        "num_requests": num_requests,
+        "requests_per_second": num_requests / elapsed if elapsed else 0.0,
+        "input_tokens_per_second": total_input / elapsed if elapsed else 0.0,
+        "metrics": metrics,
+        "per_dataset": per_dataset,
     }
 
 
@@ -1055,6 +1342,7 @@ async def run_trie_experiment(
         dtype="auto",
         context_length=config.context_length,
         max_running_requests=max(config.batch_size, 4),
+        page_size=SGLANG_PAGE_SIZE,
         chunked_prefill_size=256,
         disable_cuda_graph=True,
         disable_radix_cache=False,
@@ -1251,6 +1539,65 @@ def parse_metrics_log(
     }
 
 
+def aggregate_sglang_baselines(
+    per_dataset: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """汇总逐数据集冷启动的 SGLang 原生基线。"""
+    if not per_dataset:
+        raise ValueError("至少需要一个 SGLang 数据集结果")
+    runs = list(per_dataset.values())
+    metrics_list = [run["metrics"] for run in runs]
+    num_requests = sum(run["num_requests"] for run in runs)
+    total_input = sum(m["total_input_tokens_measured"] for m in metrics_list)
+    total_hits = sum(m["total_hit_tokens_measured"] for m in metrics_list)
+    micro = total_hits / total_input if total_input else 0.0
+    total_events = sum(m["total_request_cache_events"] for m in metrics_list)
+    macro = (
+        sum(
+            m["aggregate_hit_rate_macro"] * m["total_request_cache_events"]
+            for m in metrics_list
+        )
+        / total_events
+        if total_events
+        else 0.0
+    )
+    metrics = {
+        **metrics_list[0],
+        "prefill_hit": sum(m["prefill_hit"] for m in metrics_list),
+        "peak_full_tokens": max(m["peak_full_tokens"] for m in metrics_list),
+        "peak_radix_bytes": max(m["peak_radix_bytes"] for m in metrics_list),
+        "peak_radix_kib": max(m["peak_radix_kib"] for m in metrics_list),
+        "peak_radix_mib": max(m["peak_radix_mib"] for m in metrics_list),
+        "total_request_cache_events": sum(
+            m["total_request_cache_events"] for m in metrics_list
+        ),
+        "aggregate_hit_rate_micro": micro,
+        "aggregate_hit_rate_micro_percent": micro * 100.0,
+        "aggregate_hit_rate_macro": macro,
+        "aggregate_hit_rate_macro_percent": macro * 100.0,
+        "total_input_tokens_measured": total_input,
+        "total_hit_tokens_measured": total_hits,
+        "all_request_cache_events": sum(
+            m["all_request_cache_events"] for m in metrics_list
+        ),
+        "raw_events_count": sum(m["raw_events_count"] for m in metrics_list),
+        "summary": None,
+    }
+    first = runs[0]
+    return {
+        **first,
+        "backend": "sglang",
+        "cache_policy": "native",
+        "cache_match_mode": "token",
+        "page_size": SGLANG_PAGE_SIZE,
+        "cache_granularity_tokens": SGLANG_PAGE_SIZE,
+        "elapsed_seconds": sum(run["elapsed_seconds"] for run in runs),
+        "num_requests": num_requests,
+        "metrics": metrics,
+        "per_dataset": per_dataset,
+    }
+
+
 # ============================================================
 # 主流程
 # ============================================================
@@ -1418,7 +1765,18 @@ async def main() -> None:
             "total_input_tokens": total_tokens,
             "avg_tokens_per_sample": avg_tokens,
             "per_dataset": {
-                name: {"num_samples": len(seqs), "total_tokens": sum(len(s) for s in seqs)}
+                name: {
+                    "num_samples": len(seqs),
+                    "total_tokens": sum(len(s) for s in seqs),
+                    "prefix_opportunities": {
+                        "sglang_native_1_token": analyze_prefix_opportunities(
+                            seqs, SGLANG_PAGE_SIZE, args.batch_size
+                        ),
+                        "vllm_native_16_token": analyze_prefix_opportunities(
+                            seqs, VLLM_BLOCK_SIZE, args.batch_size
+                        ),
+                    },
+                }
                 for name, seqs in request_token_seqs_map.items()
             },
         },
@@ -1431,20 +1789,52 @@ async def main() -> None:
     # Step 3: 基线实验
     # ============================================================
     if not args.skip_baseline:
-        baseline_config = ExperimentConfig(
-            model_path=args.model_path,
-            context_length=args.context_length,
-            batch_size=args.batch_size,
-            max_input_tokens=args.max_input_tokens,
-            metrics_log_path=args.baseline_metrics,
-            scheduler=args.scheduler,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-        )
-        if args.backend == "vllm":
-            results["baseline"] = await run_vllm_baseline_experiment(
-                config=baseline_config,
-                flat_seqs=flat_seqs,
+        per_dataset_baselines: Dict[str, Dict[str, Any]] = {}
+        for dataset_name in args.datasets:
+            dataset_flat_seqs = [
+                ((dataset_name, idx), seq)
+                for idx, seq in enumerate(request_token_seqs_map[dataset_name])
+            ]
+            dataset_metrics_path = _dataset_metrics_path(
+                args.baseline_metrics, dataset_name
             )
+            baseline_config = ExperimentConfig(
+                model_path=args.model_path,
+                context_length=args.context_length,
+                batch_size=args.batch_size,
+                max_input_tokens=args.max_input_tokens,
+                metrics_log_path=dataset_metrics_path,
+                scheduler=args.scheduler,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+            print(f"\n[BASELINE] 数据集 {dataset_name}: 冷启动独立引擎")
+            if args.backend == "vllm":
+                per_dataset_baselines[dataset_name] = (
+                    await run_vllm_baseline_experiment(
+                        config=baseline_config,
+                        flat_seqs=dataset_flat_seqs,
+                    )
+                )
+            else:
+                baseline_info = await run_baseline_experiment(
+                    config=baseline_config,
+                    flat_seqs=dataset_flat_seqs,
+                )
+                baseline_metrics = parse_metrics_log(
+                    dataset_metrics_path, rid_prefix=""
+                )
+                per_dataset_baselines[dataset_name] = {
+                    **baseline_info,
+                    "backend": "sglang",
+                    "cache_policy": "native",
+                    "cache_match_mode": "token",
+                    "page_size": SGLANG_PAGE_SIZE,
+                    "cache_granularity_tokens": SGLANG_PAGE_SIZE,
+                    "metrics": baseline_metrics,
+                }
+
+        if args.backend == "vllm":
+            results["baseline"] = aggregate_vllm_baselines(per_dataset_baselines)
             baseline_metrics = results["baseline"]["metrics"]
             backend_metrics = baseline_metrics["backend_metrics"]
             print("\n[ANALYSIS] vLLM 原生指标")
@@ -1487,19 +1877,11 @@ async def main() -> None:
                 f"{backend_metrics['peak_kv_cache_usage_percent']:.2f}%"
             )
         else:
-            baseline_info = await run_baseline_experiment(
-                config=baseline_config,
-                flat_seqs=flat_seqs,
+            results["baseline"] = aggregate_sglang_baselines(
+                per_dataset_baselines
             )
-            print("\n[ANALYSIS] 解析基线指标日志 ...")
-            baseline_metrics = parse_metrics_log(
-                args.baseline_metrics, rid_prefix=""
-            )
-            results["baseline"] = {
-                **baseline_info,
-                "backend": "sglang",
-                "metrics": baseline_metrics,
-            }
+            baseline_metrics = results["baseline"]["metrics"]
+            print("\n[ANALYSIS] SGLang 逐数据集冷启动汇总")
             print(f"  峰值缓存 Token:  {baseline_metrics['peak_full_tokens']}")
             print(f"  峰值缓存 (MiB):  {baseline_metrics['peak_radix_mib']:.2f}")
             print(f"  Micro 命中率:    {baseline_metrics['aggregate_hit_rate_micro_percent']:.2f}%")
@@ -1509,28 +1891,74 @@ async def main() -> None:
     # Step 4: CSTrie 实验
     # ============================================================
     if args.backend == "sglang" and not args.skip_trie:
-        trie_config = ExperimentConfig(
-            model_path=args.model_path,
-            context_length=args.context_length,
-            batch_size=args.batch_size,
-            max_input_tokens=args.max_input_tokens,
-            metrics_log_path=args.trie_metrics,
-            scheduler=args.scheduler,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-        )
-        trie_info = await run_trie_experiment(
-            config=trie_config,
-            request_token_seqs_map=request_token_seqs_map,
-            flat_seqs=flat_seqs,
-            dataset_names=args.datasets,
-        )
-        print("\n[ANALYSIS] 解析 Trie 指标日志 ...")
-        trie_metrics = parse_metrics_log(args.trie_metrics, rid_prefix="")
-        results["trie"] = {
-            **trie_info,
-            "metrics": trie_metrics,
-        }
-        ts = trie_info.get("trie_stats", {})
+        per_dataset_tries: Dict[str, Dict[str, Any]] = {}
+        for dataset_name in args.datasets:
+            dataset_map = {dataset_name: request_token_seqs_map[dataset_name]}
+            dataset_flat_seqs = [
+                ((dataset_name, idx), seq)
+                for idx, seq in enumerate(request_token_seqs_map[dataset_name])
+            ]
+            dataset_metrics_path = _dataset_metrics_path(
+                args.trie_metrics, dataset_name
+            )
+            trie_config = ExperimentConfig(
+                model_path=args.model_path,
+                context_length=args.context_length,
+                batch_size=args.batch_size,
+                max_input_tokens=args.max_input_tokens,
+                metrics_log_path=dataset_metrics_path,
+                scheduler=args.scheduler,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+            print(f"\n[TRIE] 数据集 {dataset_name}: 冷启动独立引擎")
+            trie_info = await run_trie_experiment(
+                config=trie_config,
+                request_token_seqs_map=dataset_map,
+                flat_seqs=dataset_flat_seqs,
+                dataset_names=[dataset_name],
+            )
+            per_dataset_tries[dataset_name] = {
+                **trie_info,
+                "metrics": parse_metrics_log(dataset_metrics_path, rid_prefix=""),
+            }
+
+        aggregate_trie = aggregate_sglang_baselines(per_dataset_tries)
+        trie_stats_list = [run["trie_stats"] for run in per_dataset_tries.values()]
+        aggregate_trie.update({
+            "backend": "cstrie",
+            "cache_policy": "cstrie",
+            "batches_detail": {
+                name: run["batches_detail"] for name, run in per_dataset_tries.items()
+            },
+            "trie_stats": {
+                "total_requests": sum(s["total_requests"] for s in trie_stats_list),
+                "num_leaves": sum(s["num_leaves"] for s in trie_stats_list),
+                "num_scheduled_batches": sum(
+                    s["num_scheduled_batches"] for s in trie_stats_list
+                ),
+                "num_prefill_batches": sum(
+                    s["num_prefill_batches"] for s in trie_stats_list
+                ),
+                "num_normal_batches": sum(
+                    s["num_normal_batches"] for s in trie_stats_list
+                ),
+                "num_prefill_requests": sum(
+                    s["num_prefill_requests"] for s in trie_stats_list
+                ),
+                "num_normal_requests": sum(
+                    s["num_normal_requests"] for s in trie_stats_list
+                ),
+                "build_time_seconds": sum(
+                    s["build_time_seconds"] for s in trie_stats_list
+                ),
+                "schedule_time_seconds": sum(
+                    s["schedule_time_seconds"] for s in trie_stats_list
+                ),
+            },
+        })
+        results["trie"] = aggregate_trie
+        trie_metrics = aggregate_trie["metrics"]
+        ts = aggregate_trie.get("trie_stats", {})
         
         print(f"  Trie 叶子数:     {ts.get('num_leaves', 'N/A')}")
         print(f"  预填充请求数:    {ts.get('num_prefill_requests', 'N/A')}")

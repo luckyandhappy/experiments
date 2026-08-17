@@ -5,10 +5,15 @@ import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
+import multimodal_experiment as multimodal_module
+import run_experiment
 from multimodal_experiment import (
+    MAX_MEDIA,
     MME_CATEGORIES,
     ManifestSample,
     MultimodalSample,
@@ -17,14 +22,15 @@ from multimodal_experiment import (
     encoder_reuse_opportunity,
     get_adapter,
     manifest_samples,
-    order_samples,
     prepare_requests,
+    sample_by_media,
     validate_samples,
 )
 from run_multimodal_experiment import (
     _run_sglang_requests,
     _sglang_image_uri,
     parse_sglang_encoder_metrics,
+    run_vllm,
 )
 from scheduler import ScheduledRequest
 from xxxtrie import XXXTrieNode
@@ -156,7 +162,7 @@ class DatasetAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = make_vqav2(root)
-            manifest = build_manifest(get_adapter("vqav2"), dataset, "val", 2, 42)
+            manifest = build_manifest(get_adapter("vqav2"), dataset, "val", 42)
         self.assertEqual(manifest["num_media"], 2)
         self.assertEqual(manifest["num_samples"], 3)
         self.assertEqual({item["dataset"] for item in manifest["records"]}, {"vqav2"})
@@ -164,7 +170,7 @@ class DatasetAdapterTests(unittest.TestCase):
     def test_chartqa_combines_human_and_augmented(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = make_chartqa(Path(directory))
-            manifest = build_manifest(get_adapter("chartqa"), dataset, "test", 2, 42)
+            manifest = build_manifest(get_adapter("chartqa"), dataset, "test", 42)
         self.assertEqual(manifest["num_samples"], 3)
         self.assertEqual(
             {item["category"] for item in manifest["records"]}, {"human", "augmented"}
@@ -177,17 +183,14 @@ class DatasetAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             dataset = make_mme(Path(directory))
             adapter = get_adapter("mme")
-            full = build_manifest(adapter, dataset, "all", None, 42)
-            limited = build_manifest(adapter, dataset, "all", 2, 42)
+            full = build_manifest(adapter, dataset, "all", 42)
         self.assertEqual(full["num_media"], 14)
         self.assertEqual(full["num_samples"], 28)
-        self.assertTrue(limited["sampling"]["stratified"])
-        self.assertEqual(len({item["category"] for item in limited["records"]}), 2)
 
     def test_mme_supports_questions_and_images_beside_each_other(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = make_mme_flat_files(Path(directory))
-            manifest = build_manifest(get_adapter("mme"), dataset, "all", None, 42)
+            manifest = build_manifest(get_adapter("mme"), dataset, "all", 42)
         self.assertEqual(manifest["num_media"], 14)
         self.assertEqual(manifest["num_samples"], 28)
         self.assertTrue(
@@ -208,15 +211,15 @@ class DatasetAdapterTests(unittest.TestCase):
                 path.unlink()
             missing.rmdir()
             with self.assertRaisesRegex(FileNotFoundError, "perception/existence"):
-                build_manifest(get_adapter("mme"), dataset, "all", None, 42)
+                build_manifest(get_adapter("mme"), dataset, "all", 42)
 
     def test_manifest_checksum_excludes_absolute_root(self):
         with tempfile.TemporaryDirectory() as left_dir, tempfile.TemporaryDirectory() as right_dir:
             left = build_manifest(
-                get_adapter("vqav2"), make_vqav2(Path(left_dir)), "val", 2, 42
+                get_adapter("vqav2"), make_vqav2(Path(left_dir)), "val", 42
             )
             right = build_manifest(
-                get_adapter("vqav2"), make_vqav2(Path(right_dir)), "val", 2, 42
+                get_adapter("vqav2"), make_vqav2(Path(right_dir)), "val", 42
             )
         self.assertEqual(left["records_sha256"], right["records_sha256"])
 
@@ -263,15 +266,172 @@ class MultimodalCacheKeyTests(unittest.TestCase):
         requests = self._requests()
         opportunity = encoder_reuse_opportunity(requests)
         self.assertEqual(opportunity["potential_hits"], 1)
-        items = [
-            ManifestSample(
-                MultimodalSample("d", str(i), str(i // 2), str(i), f"/{i}.jpg"),
-                str(i),
-                str(i // 2),
-            )
-            for i in range(8)
+
+    def test_fixed_media_cap_keeps_all_questions(self):
+        self.assertEqual(MAX_MEDIA, 10_000)
+        samples = [
+            MultimodalSample("chartqa", f"{media}:{question}", str(media), "q", "/x")
+            for media in range(4)
+            for question in range(2)
         ]
-        self.assertNotEqual(order_samples(items, "grouped", 42), order_samples(items, "shuffled", 42))
+        with mock.patch.object(multimodal_module, "MAX_MEDIA", 3):
+            selected, media_ids = sample_by_media(
+                samples, get_adapter("chartqa"), seed=42
+            )
+            repeated, repeated_ids = sample_by_media(
+                samples, get_adapter("chartqa"), seed=42
+            )
+        self.assertEqual(len(media_ids), 3)
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(media_ids, repeated_ids)
+        self.assertEqual(selected, repeated)
+
+
+class VLLMAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_same_native_apc_contract_as_text_experiment(self):
+        copied_images = []
+
+        class FakeImage:
+            size = (40, 30)
+
+            def load(self):
+                return None
+
+            def copy(self):
+                copied = types.SimpleNamespace(closed=False)
+                copied.close = lambda: setattr(copied, "closed", True)
+                copied_images.append(copied)
+                return copied
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+        fake_image_module = types.SimpleNamespace(open=lambda path: FakeImage())
+
+        class FakeSamplingParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeEngineArgs:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeEngine:
+            instance = None
+
+            def __init__(self, args):
+                self.args = args
+                self.sampler_env = run_experiment.os.environ.get(
+                    "VLLM_USE_FLASHINFER_SAMPLER"
+                )
+                self.model_runner_env = run_experiment.os.environ.get(
+                    "VLLM_USE_V2_MODEL_RUNNER"
+                )
+                self.tokenizer_parallelism_env = run_experiment.os.environ.get(
+                    "TOKENIZERS_PARALLELISM"
+                )
+                self.shutdown_called = False
+                type(self).instance = self
+
+            @classmethod
+            def from_engine_args(cls, args):
+                return cls(args)
+
+            async def generate(self, prompt, sampling, request_id):
+                yield types.SimpleNamespace(
+                    finished=True,
+                    num_cached_tokens=2,
+                    num_cache_creation_tokens=3,
+                )
+
+            def shutdown(self):
+                self.shutdown_called = True
+
+        fake_vllm = types.SimpleNamespace(
+            AsyncEngineArgs=FakeEngineArgs,
+            AsyncLLMEngine=FakeEngine,
+            SamplingParams=FakeSamplingParams,
+        )
+
+        def import_module(name):
+            if name == "vllm":
+                return fake_vllm
+            if name == "PIL.Image":
+                return fake_image_module
+            raise ImportError(name)
+
+        snapshot = run_experiment._VLLMMetricSnapshot(
+            values={}, cache_configs=({"kv_cache_size_tokens": "1000"},)
+        )
+        requests = MultimodalCacheKeyTests()._requests()[:2]
+        with (
+            mock.patch.dict(
+                run_experiment.os.environ,
+                {"VLLM_USE_FLASHINFER_SAMPLER": "1"},
+            ),
+            mock.patch(
+                "run_multimodal_experiment.importlib.import_module",
+                side_effect=import_module,
+            ),
+            mock.patch.object(
+                run_experiment, "validate_vllm_version", return_value="0.26.0"
+            ),
+            mock.patch.object(
+                run_experiment,
+                "_run_vllm_apc_self_test",
+                new=mock.AsyncMock(
+                    return_value={"passed": True, "observed_hit_tokens": 16}
+                ),
+            ),
+            mock.patch.object(
+                run_experiment, "_read_vllm_metric_snapshot", return_value=snapshot
+            ),
+        ):
+            result = await run_vllm(
+                None,
+                model_path="fake-model",
+                context_length=4096,
+                batch_size=2,
+                gpu_memory_utilization=0.8,
+                eos_token_id=2,
+                request_factory=lambda: requests,
+            )
+
+        engine = FakeEngine.instance
+        self.assertEqual(engine.sampler_env, "0")
+        self.assertEqual(engine.model_runner_env, "0")
+        self.assertEqual(engine.tokenizer_parallelism_env, "false")
+        self.assertEqual(engine.args.kwargs["block_size"], 16)
+        self.assertNotIn("prefix_match_unit", engine.args.kwargs)
+        self.assertTrue(engine.args.kwargs["enable_prefix_caching"])
+        self.assertFalse(engine.args.kwargs["async_scheduling"])
+        self.assertEqual(
+            engine.args.kwargs["limit_mm_per_prompt"],
+            {"image": 1, "video": 0},
+        )
+        self.assertTrue(engine.args.kwargs["skip_mm_profiling"])
+        self.assertNotIn("mm_processor_kwargs", engine.args.kwargs)
+        self.assertTrue(engine.shutdown_called)
+        self.assertTrue(all(image.closed for image in copied_images))
+        self.assertEqual(result["kv_cache"]["cache_hit_tokens"], 4)
+        self.assertEqual(result["kv_cache"]["cache_creation_tokens"], 6)
+        self.assertEqual(result["backend_metrics"]["cache_match_mode"], "block")
+        self.assertEqual(result["backend_metrics"]["block_size"], 16)
+        self.assertEqual(
+            result["backend_metrics"]["observed_max_image_pixels"], 1200
+        )
+        self.assertTrue(result["backend_metrics"]["skip_mm_profiling"])
+        self.assertEqual(result["backend_metrics"]["model_runner"], "v1")
+        self.assertFalse(result["backend_metrics"]["async_scheduling"])
+        self.assertFalse(result["backend_metrics"]["tokenizers_parallelism"])
+        self.assertEqual(
+            result["backend_metrics"]["cache_self_test"]["observed_hit_tokens"],
+            16,
+        )
+        self.assertFalse(result["backend_metrics"]["flashinfer_sampler_enabled"])
 
 
 class SGLangAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -356,8 +516,6 @@ class CLITests(unittest.TestCase):
                     str(root),
                     "--output-dir",
                     str(output),
-                    "--num-media",
-                    "2",
                     "--prepare-only",
                 ],
                 cwd=".",
@@ -389,8 +547,6 @@ class CLITests(unittest.TestCase):
                     "chartqa=test",
                     "--output-dir",
                     str(output),
-                    "--num-media",
-                    "2",
                     "--prepare-only",
                 ],
                 cwd=".",

@@ -14,6 +14,7 @@ from typing import Any, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple
 
 RequestID = Tuple[str, int]
 CacheKey = Hashable
+MAX_MEDIA = 10_000
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 MME_CATEGORIES = {
     "perception": {
@@ -73,7 +74,6 @@ class PreparedMultimodalRequest:
 class DatasetAdapter(ABC):
     name: str
     default_split: str
-    default_num_media: Optional[int] = 200
     stratify_limited_sampling: bool = False
 
     @abstractmethod
@@ -219,7 +219,6 @@ def _parse_mme_question_file(path: Path) -> List[Tuple[str, str]]:
 class MMEAdapter(DatasetAdapter):
     name = "mme"
     default_split = "all"
-    default_num_media = None
     stratify_limited_sampling = True
 
     def load(self, dataset_root: Path, split: str) -> List[MultimodalSample]:
@@ -339,18 +338,14 @@ def _select_media_stratified(
 def sample_by_media(
     samples: Sequence[MultimodalSample],
     adapter: DatasetAdapter,
-    num_media: Optional[int],
     seed: int,
 ) -> Tuple[List[MultimodalSample], List[str]]:
-    effective_limit = adapter.default_num_media if num_media is None else num_media
     all_media = sorted({sample.media_id for sample in samples})
-    if effective_limit is None:
+    if len(all_media) <= MAX_MEDIA:
         selected_media = all_media
     else:
-        if effective_limit <= 0:
-            raise ValueError("num_media 必须大于 0")
         selector = _select_media_stratified if adapter.stratify_limited_sampling else _select_media
-        selected_media = selector(samples, effective_limit, seed)
+        selected_media = selector(samples, MAX_MEDIA, seed)
     grouped: Dict[str, List[MultimodalSample]] = {}
     for sample in samples:
         grouped.setdefault(sample.media_id, []).append(sample)
@@ -374,12 +369,12 @@ def build_manifest(
     adapter: DatasetAdapter,
     dataset_root: Path,
     split: str,
-    num_media: Optional[int],
     seed: int,
 ) -> Dict[str, Any]:
     loaded = adapter.load(dataset_root, split)
     validate_samples(loaded, adapter.name)
-    selected, selected_media = sample_by_media(loaded, adapter, num_media, seed)
+    total_media = len({sample.media_id for sample in loaded})
+    selected, selected_media = sample_by_media(loaded, adapter, seed)
     media_hashes = {
         media_id: sha256_file(Path(next(s.image_path for s in selected if s.media_id == media_id)))
         for media_id in selected_media
@@ -404,9 +399,11 @@ def build_manifest(
         "dataset_root": str(dataset_root.resolve()),
         "seed": seed,
         "sampling": {
-            "requested_num_media": num_media,
-            "default_num_media": adapter.default_num_media,
-            "stratified": adapter.stratify_limited_sampling and num_media is not None,
+            "requested_num_media": None,
+            "default_num_media": MAX_MEDIA,
+            "total_media": total_media,
+            "truncated": total_media > MAX_MEDIA,
+            "stratified": adapter.stratify_limited_sampling and total_media > MAX_MEDIA,
         },
         "num_media": len(selected_media),
         "num_samples": len(records),
@@ -448,18 +445,6 @@ def manifest_samples(manifest: Mapping[str, Any]) -> List[ManifestSample]:
             )
         )
     return result
-
-
-def order_samples(
-    samples: Sequence[ManifestSample], order: str, seed: int
-) -> List[ManifestSample]:
-    ordered = list(samples)
-    if order == "grouped":
-        return ordered
-    if order == "shuffled":
-        random.Random(seed).shuffle(ordered)
-        return ordered
-    raise ValueError(f"未知请求顺序: {order}")
 
 
 def _flatten_input_ids(value: Any) -> List[int]:

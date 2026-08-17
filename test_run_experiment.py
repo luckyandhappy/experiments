@@ -56,6 +56,63 @@ class VLLMVersionTests(unittest.TestCase):
 
 
 class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vllm_requests_use_strict_batches(self):
+        events = []
+
+        class FakeSamplingParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeEngine:
+            async def generate(self, prompt, sampling_params, request_id):
+                events.append(("start", request_id))
+                await asyncio.sleep(0.01)
+                events.append(("finish", request_id))
+                yield types.SimpleNamespace(
+                    finished=True,
+                    num_cached_tokens=0,
+                    num_cache_creation_tokens=len(prompt["prompt_token_ids"]),
+                )
+
+        requests = [(('data', i), [1, 2, i]) for i in range(5)]
+        await run_experiment._send_requests_vllm(
+            FakeEngine(), FakeSamplingParams, requests, tokenizer_eos_id=2,
+            batch_size=2,
+        )
+
+        third_start = events.index(("start", "data:0002"))
+        self.assertLess(events.index(("finish", "data:0000")), third_start)
+        self.assertLess(events.index(("finish", "data:0001")), third_start)
+
+    async def test_vllm_apc_self_test_requires_full_native_block(self):
+        class FakeSamplingParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeEngine:
+            def __init__(self):
+                self.reset_called = False
+
+            async def generate(self, prompt, sampling_params, request_id):
+                hit = 16 if request_id.endswith("0001") else 0
+                yield types.SimpleNamespace(
+                    finished=True,
+                    num_cached_tokens=hit,
+                    num_cache_creation_tokens=16,
+                )
+
+            async def reset_prefix_cache(self):
+                self.reset_called = True
+                return True
+
+        engine = FakeEngine()
+        result = await run_experiment._run_vllm_apc_self_test(
+            engine, FakeSamplingParams, tokenizer_eos_id=2,
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["observed_hit_tokens"], 16)
+        self.assertTrue(engine.reset_called)
+
     async def test_vllm_main_writes_baseline_only_result(self):
         class FakeTokenizer:
             eos_token_id = 2
@@ -121,6 +178,11 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 mock.patch.object(
                     run_experiment,
+                    "aggregate_vllm_baselines",
+                    return_value=baseline_result,
+                ),
+                mock.patch.object(
+                    run_experiment,
                     "run_trie_experiment",
                     run_trie,
                 ),
@@ -161,6 +223,15 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
 
             def __init__(self, engine_args):
                 self.engine_args = engine_args
+                self.sampler_env = run_experiment.os.environ.get(
+                    "VLLM_USE_FLASHINFER_SAMPLER"
+                )
+                self.model_runner_env = run_experiment.os.environ.get(
+                    "VLLM_USE_V2_MODEL_RUNNER"
+                )
+                self.tokenizer_parallelism_env = run_experiment.os.environ.get(
+                    "TOKENIZERS_PARALLELISM"
+                )
                 self.requests = []
                 self.did_shutdown = False
                 type(self).instance = self
@@ -235,6 +306,10 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
         requests = [(('data', 0), [1, 2, 3]), (('data', 1), [1, 2, 4, 5])]
 
         with (
+            mock.patch.dict(
+                run_experiment.os.environ,
+                {"VLLM_USE_FLASHINFER_SAMPLER": "1"},
+            ),
             mock.patch.dict(sys.modules, {"vllm": fake_vllm}),
             mock.patch.object(
                 run_experiment.importlib.metadata,
@@ -251,6 +326,17 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
                 "_read_vllm_metric_snapshot",
                 side_effect=read_metrics,
             ),
+            mock.patch.object(
+                run_experiment,
+                "_run_vllm_apc_self_test",
+                new=mock.AsyncMock(
+                    return_value={
+                        "passed": True,
+                        "expected_min_hit_tokens": 16,
+                        "observed_hit_tokens": 16,
+                    }
+                ),
+            ),
         ):
             result = await run_experiment.run_vllm_baseline_experiment(
                 config,
@@ -262,9 +348,10 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.engine_args.kwargs["max_num_seqs"], 2)
         self.assertEqual(engine.engine_args.kwargs["max_model_len"], 4096)
         self.assertEqual(engine.engine_args.kwargs["block_size"], 16)
-        self.assertEqual(engine.engine_args.kwargs["prefix_match_unit"], 2)
+        self.assertNotIn("prefix_match_unit", engine.engine_args.kwargs)
         self.assertEqual(engine.engine_args.kwargs["gpu_memory_utilization"], 0.75)
         self.assertTrue(engine.engine_args.kwargs["enable_prefix_caching"])
+        self.assertFalse(engine.engine_args.kwargs["async_scheduling"])
         self.assertEqual(
             [request[0] for request in engine.requests],
             [
@@ -280,8 +367,18 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["backend"], "vllm")
         self.assertEqual(result["backend_version"], "0.26.1")
+        self.assertEqual(result["cache_policy"], "native")
+        self.assertEqual(result["cache_match_mode"], "block")
         self.assertEqual(result["block_size"], 16)
-        self.assertEqual(result["prefix_match_unit"], 2)
+        self.assertEqual(result["cache_granularity_tokens"], 16)
+        self.assertEqual(result["sampler_backend"], "native")
+        self.assertFalse(result["flashinfer_sampler_enabled"])
+        self.assertEqual(engine.sampler_env, "0")
+        self.assertEqual(engine.model_runner_env, "0")
+        self.assertEqual(engine.tokenizer_parallelism_env, "false")
+        self.assertEqual(result["model_runner"], "v1")
+        self.assertFalse(result["async_scheduling"])
+        self.assertFalse(result["tokenizers_parallelism"])
         self.assertEqual(result["metrics"]["total_input_tokens_measured"], 7)
         self.assertEqual(result["metrics"]["total_hit_tokens_measured"], 4)
         self.assertEqual(result["metrics"]["cache_hit_tokens"], 4)
@@ -388,6 +485,19 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
                 "kv_cache_memory_bytes",
             )
         )
+
+
+class PrefixOpportunityTests(unittest.TestCase):
+    def test_analysis_respects_batch_visibility_and_match_unit(self):
+        seqs = [[1, 2, 3], [1, 2, 4], [1, 2, 3, 5]]
+        token_result = run_experiment.analyze_prefix_opportunities(
+            seqs, match_unit=1, batch_size=2
+        )
+        block_result = run_experiment.analyze_prefix_opportunities(
+            seqs, match_unit=2, batch_size=2
+        )
+        self.assertEqual(token_result["potential_hit_tokens"], 3)
+        self.assertEqual(block_result["potential_hit_tokens"], 2)
 
 
 if __name__ == "__main__":
