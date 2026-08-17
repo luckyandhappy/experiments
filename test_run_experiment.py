@@ -56,6 +56,54 @@ class VLLMVersionTests(unittest.TestCase):
         self.assertIn("不能同时指定 --skip-baseline", completed.stderr)
 
 
+class SGLangSelfTestTests(unittest.IsolatedAsyncioTestCase):
+    def test_missing_sglang_distribution_reports_active_interpreter(self):
+        with (
+            mock.patch.object(
+                run_experiment.importlib.metadata,
+                "version",
+                side_effect=run_experiment.importlib.metadata.PackageNotFoundError,
+            ),
+            self.assertRaisesRegex(RuntimeError, r"\.venv_sglang"),
+        ):
+            run_experiment._load_sglang()
+
+    async def test_uses_async_tokenizer_manager_flush_inside_running_loop(self):
+        class FakeManager:
+            def __init__(self):
+                self.flushed = False
+
+            async def flush_cache(self):
+                self.flushed = True
+                return True
+
+        class FakeEngine:
+            def __init__(self, metrics_path):
+                self.metrics_path = metrics_path
+                self.tokenizer_manager = FakeManager()
+
+            async def async_generate(self, **kwargs):
+                if kwargs["rid"].endswith(":1"):
+                    with self.metrics_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps({
+                            "rid": kwargs["rid"],
+                            "prefix_cache_hit_token_count": 3,
+                        }) + "\n")
+
+            def flush_cache(self):
+                raise AssertionError("异步循环中不应调用同步 Engine.flush_cache")
+
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / "metrics.jsonl"
+            engine = FakeEngine(metrics_path)
+            result = await run_experiment._run_sglang_cache_self_test(
+                engine, str(metrics_path), tokenizer_eos_id=2
+            )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["observed_hit_tokens"], 3)
+        self.assertTrue(engine.tokenizer_manager.flushed)
+
+
 class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
     async def test_vllm_requests_use_strict_batches(self):
         events = []
@@ -192,6 +240,7 @@ class VLLMBaselineTests(unittest.IsolatedAsyncioTestCase):
 
             result_paths = list(Path(output).glob("advbench/*/result.json"))
             self.assertEqual(len(result_paths), 1)
+            self.assertTrue((result_paths[0].parent / "artifacts").is_dir())
             with result_paths[0].open("r", encoding="utf-8") as result_file:
                 result = json.load(result_file)
             self.assertTrue((Path(output) / "results_report.md").is_file())

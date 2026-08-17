@@ -31,6 +31,7 @@ import inspect
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,14 +251,34 @@ def _dataset_metrics_path(path: str, dataset_name: str) -> str:
 # SGLang 请求发送
 # ============================================================
 
-def _load_sglang():
+def _load_sglang() -> Any:
     """只在 SGLang 实验分支导入运行时依赖。"""
     try:
-        return importlib.import_module("sglang")
+        importlib.metadata.version("sglang")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "选择了 SGLang 后端，但当前 Python 环境未安装 SGLang；"
+            f"当前解释器: {sys.executable}。请先启用 .venv_sglang"
+        ) from exc
+    local_sglang = Path(_EXPERIMENT_DIR).parent / "sglang"
+    local_parent = str(local_sglang.parent)
+    if (local_sglang / "srt" / "managers" / "custom_cache_chunk.py").is_file():
+        if local_parent not in sys.path:
+            sys.path.insert(0, local_parent)
+    try:
+        module = importlib.import_module("sglang")
     except ImportError as exc:
         raise RuntimeError(
-            "选择了 SGLang 后端，但当前环境未安装 sglang"
+            "选择了 SGLang 后端，但当前 Python 环境缺少 SGLang 运行依赖；"
+            f"当前解释器: {sys.executable}。请先启用 .venv_sglang"
         ) from exc
+    module_path = Path(getattr(module, "__file__", "")).resolve()
+    if local_sglang.is_dir() and local_sglang.resolve() not in module_path.parents:
+        raise RuntimeError(
+            "SGLang 后端需要项目内带缓存指标补丁的本地 fork，但当前加载了 "
+            f"{module_path}。请确认没有预先 import sglang，并启用 .venv_sglang"
+        )
+    return module
 
 async def _send_requests_with_cache_policy(
     llm: Any,
@@ -492,7 +513,12 @@ async def _run_sglang_cache_self_test(
             f"重复请求命中 {observed_hit} tokens"
         )
 
-    flush_result = llm.flush_cache()
+    tokenizer_manager = getattr(llm, "tokenizer_manager", None)
+    async_flush = getattr(tokenizer_manager, "flush_cache", None)
+    if callable(async_flush):
+        flush_result = async_flush()
+    else:
+        flush_result = llm.flush_cache()
     if inspect.isawaitable(flush_result):
         flush_result = await flush_result
     if flush_result is False:
@@ -1777,6 +1803,7 @@ async def main() -> None:
     identity = build_identity(dataset_hashes, identity_parameters)
     experiment_dir = result_directory(args.output_dir, identity)
     artifacts_dir = experiment_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     if args.baseline_metrics is None:
         args.baseline_metrics = str(artifacts_dir / "baseline_metrics.jsonl")
     if args.trie_metrics is None:

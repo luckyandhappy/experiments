@@ -1,42 +1,10 @@
-## 1 缓存命中及内存开销实验
+# CSTrie Experiment Results
 
-> 实验超参数：`CONTEXT_LENGTH = 4096`，`MAX_INPUT_TOKENS = 1024`，`BATCH_SIZE = 8`，`MAX_NEW_TOKENS = 1`
-
-### 1.1 vLLM 基线
-
-|  数据集  | 样本量 | 总 Token 量 | 缓存总命中 | 缓存峰值 | 缓存峰值大小 | Macro 命中率 | Micro 命中率 |
-| :------: | :----: | :---------: | :--------: | :------: | :----------: | :----------: | :----------: |
-| advbench |  520   |    6668     |     0      |   144    |  20.25 MiB   |    0.00%     |    0.00%     |
-|  alpaca  | 31323  |   381309    |     16     |   240    |  33.75 MiB   |    0.00%     |    0.00%     |
-|  squad   | 10570  |   1972761   |  1408688   |   1841   |  258.90 MiB  |    69.94%    |    71.41%    |
-
-### 1.2 SGLang 基线
-
-|  数据集  | 样本量 | 总 Token 量 | 缓存总命中 | 缓存峰值 | 缓存峰值大小 | Macro 命中率 | Micro 命中率 |
-| :------: | :----: | :---------: | :--------: | :------: | :----------: | :----------: | :----------: |
-| advbench |  520   |    6668     |    2225    |   4942   |  695.00 MiB  |    35.25%    |    33.37%    |
-|  alpaca  | 31323  |   381309    |   92754    |  22912   | 3222.14 MiB  |    26.42%    |    24.33%    |
-|  squad   | 10570  |   1972761   |  1101503   |  22911   | 3222.00 MiB  |    55.84%    |    52.91%    |
-
-### 1.3 基于 CSTrie 的缓存调度
-
-|  数据集  | 样本量 | 总 Token 量 | 缓存总命中 | 缓存峰值 | 缓存峰值大小 | Macro 命中率 | Micro 命中率 |
-| :------: | :----: | :---------: | :--------: | :------: | :----------: | :----------: | :----------: |
-| advbench |  520   |    6668     |    2243    |   485    |  68.207 MiB  |   35.4119%   |   33.6383%   |
-|  alpaca  | 31323  |   381309    |   115088   |  12543   | 1763.961 MiB |   32.5757%   |   30.1823%   |
-|  squad   | 10570  |   1972761   |  1463873   |  22744   | 3198.51 MiB  |    74.20%    |    73.20%    |
-
-## 2 调度算法对比实验
-
-> 实验超参数：`CONTEXT_LENGTH = 4096`，`MAX_INPUT_TOKENS = 1024`，`BATCH_SIZE = 8`，`MAX_NEW_TOKENS = 1`
-
-### 2.1 命中对比
-
-> 表格数据：模拟器命中 / 实际命中
-
-|  数据集  |     DFS     |     BFS     |     启发式      |
-| :------: | :---------: | :---------: | :-------------: |
-| advbench |   135/135   |   262/262   |     285/285     |
-|  alpaca  | 12618/12618 | 14450/14450 |   15840/15840   |
-|  squad   |     OOM     |     OOM     | 1425535/1463873 |
-
+| Dataset | Run ID | Backend | Policy | Status | Runs | Total Tokens | Hit Tokens | Peak Cache Tokens | Peak Cache Size | Micro | Macro | Result |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| advbench | `2727a283e3c1` | cstrie | cstrie | ok | 1/1 | 6,668 | 2,163 | 485 | 68.21 MiB | 32.44% | 34.16% | [advbench/2727a283e3c1/result.json](advbench/2727a283e3c1/result.json) |
+| advbench | `2727a283e3c1` | sglang | native | ok | 1/1 | 6,668 | 2,221 | 4,943 | 695.14 MiB | 33.31% | 35.19% | [advbench/2727a283e3c1/result.json](advbench/2727a283e3c1/result.json) |
+| vqav2 | `legacy:results` | vllm | native | ok | 1/1 | 15,100,222 | 11,489,216 | 0 | N/A | 76.09% | 75.82% | [multimodal/vqav2/results.json](multimodal/vqav2/results.json) |
+| squad | `ad3f99bf0c74` | cstrie | cstrie | ok | 1/1 | 1,972,761 | 1,431,050 | 22,901 | 3220.59 MiB | 72.54% | 71.76% | [squad/ad3f99bf0c74/result.json](squad/ad3f99bf0c74/result.json) |
+| squad | `ad3f99bf0c74` | sglang | native | ok | 1/1 | 1,972,761 | 1,126,234 | 22,912 | 3222.14 MiB | 57.09% | 54.16% | [squad/ad3f99bf0c74/result.json](squad/ad3f99bf0c74/result.json) |
+| vqav2 | `5c695c84b60b` | sglang | native | ok | 1/1 | 15,100,222 | N/A | N/A | N/A | N/A | N/A | [vqav2/5c695c84b60b/result.json](vqav2/5c695c84b60b/result.json) |

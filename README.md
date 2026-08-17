@@ -275,6 +275,9 @@ tokenizer 线程池先于 EngineCore 创建而导致多进程 pinned-memory 初�
 `run_experiment.py` 支持两种互斥的运行模式：
 
 ```bash
+# SGLang/CSTrie 实验必须使用项目的 SGLang 环境；入口会自动加载相邻的本地 fork
+source /home/mp/Projects/newcache/.venv_sglang/bin/activate
+
 # 保持原有流程：运行 SGLang 基线和 CSTrie（可继续使用 skip 参数）
 python run_experiment.py --backend sglang
 
