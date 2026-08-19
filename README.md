@@ -258,6 +258,50 @@ python run_multimodal_experiment.py --backend vllm --datasets vqav2
 
 视觉缓存的 `potential_hits` 仅表示由重复图片推导出的理论机会；只有后端
 实际暴露的 encoder-cache 计数才会列为实测指标。
+
+#### 跨进程 KV 缓存导入与导出
+
+文本和多模态脚本均可通过 SGLang HiCache 文件后端持久化真实的解码器 KV
+缓存。缓存包包含版本化 manifest，并按实验类型、后端策略和数据集隔离；模型、
+tokenizer 或 SGLang 缓存 ABI 不兼容时会在启动引擎前拒绝导入。
+
+```bash
+# 首次文本实验：导出 baseline 与 CSTrie 的独立缓存分片
+python run_experiment.py \
+  --backend sglang \
+  --datasets advbench \
+  --export-cache /data/cache-bundles/qwen3-text
+
+# 后续进程只读复用；cache miss 会正常计算，但不会修改导入包
+python run_experiment.py \
+  --backend sglang \
+  --datasets advbench \
+  --import-cache /data/cache-bundles/qwen3-text
+
+# 导入旧包并导出包含旧页和新增页的完整独立包
+python run_experiment.py \
+  --backend sglang \
+  --datasets advbench alpaca \
+  --import-cache /data/cache-bundles/qwen3-text \
+  --export-cache /data/cache-bundles/qwen3-text-v2
+
+# 多模态 cstrie 使用相同接口
+python run_multimodal_experiment.py \
+  --backend cstrie \
+  --datasets vqav2 \
+  --export-cache /data/cache-bundles/qwen3-vl
+```
+
+多次 repetition 使用独立暂存分片，前一次导出的页不会影响同一命令中的下一次
+冷启动；全部运行成功后才会合并并发布 `manifest.json`。`result.json` 中的
+`persistent_cache` 会记录磁盘缓存命中 token 数、请求数、页数、字节数和缓存包
+ID。多模态模式仅持久化解码器 KV；视觉编码器 embedding 仍是进程内缓存。
+
+该功能不支持 vLLM，也不能与 `--prepare-only` 同时使用。导出目录如果非空，
+必须已经是兼容缓存包；不同 import/export 路径会生成可独立迁移的完整导出包，
+不会修改导入源。磁盘容量和淘汰策略沿用
+`SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE`、
+`SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE` 等 SGLang 环境变量。
 SGLang 指标日志可使用逐请求字段 `encoder_cache_hit`，或累计字段
 `encoder_cache_hits`、`encoder_cache_misses`、`encoder_cache_entries` 和
 `encoder_cache_capacity_embeddings`；脚本会自动识别并归一化。

@@ -47,6 +47,15 @@ from experiment_results import (
     write_experiment,
     write_results_summary,
 )
+from cache_bundle import (
+    CacheBundle,
+    CacheHitStats,
+    CacheRun,
+    build_compatibility,
+    cache_identity_parameters,
+    hicache_engine_kwargs,
+    inspect_import_bundle,
+)
 
 # vLLM 模式不能隐式依赖 SGLang、Trie 或调度器，因此这些模块只在
 # SGLang/CSTrie 分支中加载。RequestID 是二元组，可安全地在此定义。
@@ -287,7 +296,7 @@ async def _send_requests_with_cache_policy(
     rid_to_seq: Dict[RequestID, List[int]],
     tokenizer_eos_id: int,
     batch_size: int,
-) -> None:
+) -> CacheHitStats:
     """严格按调度器返回的批次结构, 分两阶段执行请求
     Phase A (预填充): 遍历 prefill_batches, 每个批次内的请求并发执行
       每个请求设置 custom_cache_prefix_len = depth, 使 SGLang 只缓存指定深度的前缀
@@ -295,6 +304,7 @@ async def _send_requests_with_cache_policy(
       设置 bootstrap_host 占位值, 跳过 RadixCache 写入, 依赖 Phase A 写入的缓存
     """
     sem = asyncio.Semaphore(batch_size * 2)
+    storage_stats = CacheHitStats()
 
     async def _send_prefill(rid: RequestID, seq: List[int], depth: int) -> None:
         async with sem:
@@ -308,9 +318,10 @@ async def _send_requests_with_cache_policy(
                 "custom_params": {"custom_cache_prefix_len": depth},
             }
             try:
-                await llm.async_generate(
+                response = await llm.async_generate(
                     input_ids=seq, sampling_params=sp, stream=False, rid=sgl_rid,
                 )
+                storage_stats.observe(response)
             except Exception as exc:
                 print(f"[PREFILL] 请求 {sgl_rid} (depth={depth}) 失败: {exc}")
 
@@ -325,10 +336,11 @@ async def _send_requests_with_cache_policy(
                 "skip_special_tokens": True,
             }
             try:
-                await llm.async_generate(
+                response = await llm.async_generate(
                     input_ids=seq, sampling_params=sp, stream=False, rid=sgl_rid,
                     bootstrap_host=_FAKE_BOOTSTRAP_HOST,
                 )
+                storage_stats.observe(response)
             except Exception as exc:
                 print(f"[NORMAL] 请求 {sgl_rid} 失败: {exc}")
 
@@ -376,6 +388,7 @@ async def _send_requests_with_cache_policy(
                 await asyncio.gather(*tasks)
             print(f"    Batch {bi}: {len(tasks)} 请求完成")
         print(f"  [PHASE B] 正常执行全部完成")
+    return storage_stats
 
 
 async def _send_scheduled_batches_with_cache_policy(
@@ -384,9 +397,10 @@ async def _send_scheduled_batches_with_cache_policy(
     rid_to_seq: Dict[RequestID, List[int]],
     tokenizer_eos_id: int,
     batch_size: int,
-) -> None:
+) -> CacheHitStats:
     """按统一时序批次交错执行预填充和普通请求。"""
     sem = asyncio.Semaphore(batch_size * 2)
+    storage_stats = CacheHitStats()
 
     async def send(task: ScheduledRequest) -> None:
         seq = rid_to_seq.get(task.request_id)
@@ -412,13 +426,14 @@ async def _send_scheduled_batches_with_cache_policy(
                 kwargs["bootstrap_host"] = _FAKE_BOOTSTRAP_HOST
 
             try:
-                await llm.async_generate(
+                response = await llm.async_generate(
                     input_ids=seq,
                     sampling_params=sp,
                     stream=False,
                     rid=sgl_rid,
                     **kwargs,
                 )
+                storage_stats.observe(response)
             except Exception as exc:
                 print(f"[{task.kind.upper()}] 请求 {sgl_rid} 失败: {exc}")
                 if task.kind == "prefill":
@@ -436,6 +451,7 @@ async def _send_scheduled_batches_with_cache_policy(
             f"(prefill={prefill_count}, normal={len(batch) - prefill_count})"
         )
     print("  [SCHEDULE] 全部时序批次完成")
+    return storage_stats
 
 
 async def _send_requests_baseline(
@@ -443,9 +459,10 @@ async def _send_requests_baseline(
     flat_seqs: List[Tuple[RequestID, List[int]]],
     tokenizer_eos_id: int,
     batch_size: int,
-) -> None:
+) -> CacheHitStats:
     """基线模式: 按原始顺序发送所有请求, 不进行任何缓存策略干预"""
     sem = asyncio.Semaphore(batch_size * 2)
+    storage_stats = CacheHitStats()
 
     async def _run_one(rid: RequestID, seq: List[int]) -> None:
         async with sem:
@@ -458,12 +475,13 @@ async def _send_requests_baseline(
                 "skip_special_tokens": True,
             }
             try:
-                await llm.async_generate(
+                response = await llm.async_generate(
                     input_ids=seq,
                     sampling_params=sp,
                     stream=False,
                     rid=sgl_rid,
                 )
+                storage_stats.observe(response)
             except Exception as exc:
                 print(f"[BASELINE] 请求 {sgl_rid} 失败: {exc}")
 
@@ -472,6 +490,7 @@ async def _send_requests_baseline(
     for start in range(0, len(flat_seqs), batch_size):
         batch = flat_seqs[start : start + batch_size]
         await asyncio.gather(*(_run_one(rid, seq) for rid, seq in batch))
+    return storage_stats
 
 
 async def _run_sglang_cache_self_test(
@@ -550,6 +569,8 @@ class ExperimentConfig:
 async def run_baseline_experiment(
     config: ExperimentConfig,
     flat_seqs: List[Tuple[RequestID, List[int]]],
+    cache_bundle: Optional[CacheBundle] = None,
+    cache_run: Optional[CacheRun] = None,
 ) -> Dict[str, Any]:
     """执行 SGLang 基线实验"""
     sgl = _load_sglang()
@@ -577,6 +598,9 @@ async def run_baseline_experiment(
         raise ValueError("tokenizer.eos_token_id 不能为 None")
 
     print("[BASELINE] 启动 SGLang Engine ...")
+    cache_kwargs = (
+        hicache_engine_kwargs(cache_bundle.compatibility) if cache_bundle else {}
+    )
     llm = sgl.Engine(
         model_path=config.model_path,
         tp_size=1,
@@ -592,8 +616,10 @@ async def run_baseline_experiment(
         log_level="info",
         # 暂时禁用flashinfer
         attention_backend="triton",
+        **cache_kwargs,
     )
 
+    storage_stats = CacheHitStats()
     try:
         print("[BASELINE] 验证 SGLang 原生 token RadixCache ...")
         cache_self_test = await _run_sglang_cache_self_test(
@@ -601,26 +627,37 @@ async def run_baseline_experiment(
             config.metrics_log_path,
             tokenizer.eos_token_id,
         )
+        if cache_bundle:
+            await cache_bundle.attach(llm, cache_run)
         print("[BASELINE] 发送请求 (无缓存策略干预) ...")
-        await _send_requests_baseline(
+        storage_stats = await _send_requests_baseline(
             llm=llm,
             flat_seqs=flat_seqs,
             tokenizer_eos_id=tokenizer.eos_token_id,
             batch_size=config.batch_size,
         )
+        if cache_run:
+            cache_run.stats.merge(storage_stats)
     finally:
-        print("[BASELINE] 关闭 Engine ...")
-        llm.shutdown()
-        await asyncio.sleep(2)
+        try:
+            if cache_bundle:
+                await cache_bundle.detach(llm, cache_run)
+        finally:
+            print("[BASELINE] 关闭 Engine ...")
+            llm.shutdown()
+            await asyncio.sleep(2)
 
     elapsed = time.time() - t0
     print(f"[BASELINE] 完成, 耗时 {elapsed:.1f}s")
 
-    return {
+    result = {
         "elapsed_seconds": elapsed,
         "num_requests": len(flat_seqs),
         "cache_self_test": cache_self_test,
     }
+    if cache_bundle:
+        result["persistent_cache"] = cache_bundle.run_summary(cache_run)
+    return result
 
 
 def validate_vllm_version(version: Optional[str] = None) -> str:
@@ -1204,6 +1241,8 @@ async def run_trie_experiment(
     request_token_seqs_map: Dict[str, List[List[int]]],
     flat_seqs: List[Tuple[RequestID, List[int]]],
     dataset_names: List[str],
+    cache_bundle: Optional[CacheBundle] = None,
+    cache_run: Optional[CacheRun] = None,
 ) -> Dict[str, Any]:
     """执行 CSTrie 前缀缓存预填充实验"""
     sgl = _load_sglang()
@@ -1373,6 +1412,9 @@ async def run_trie_experiment(
 
     # ---- Phase 4: 启动 Engine 并执行 ----
     print("[TRIE] Phase 4: 启动 SGLang Engine 并执行请求 ...")
+    cache_kwargs = (
+        hicache_engine_kwargs(cache_bundle.compatibility) if cache_bundle else {}
+    )
     llm = sgl.Engine(
         model_path=config.model_path,
         tp_size=1,  # 张量并行大小 (单张 GPU)
@@ -1387,11 +1429,15 @@ async def run_trie_experiment(
         disable_radix_cache=False,
         log_level="info",
         attention_backend="triton",
+        **cache_kwargs,
     )
 
+    storage_stats = CacheHitStats()
     try:
+        if cache_bundle:
+            await cache_bundle.attach(llm, cache_run)
         if scheduled_batches is not None:
-            await _send_scheduled_batches_with_cache_policy(
+            storage_stats = await _send_scheduled_batches_with_cache_policy(
                 llm=llm,
                 scheduled_batches=scheduled_batches,
                 rid_to_seq=rid_to_seq,
@@ -1399,7 +1445,7 @@ async def run_trie_experiment(
                 batch_size=config.batch_size,
             )
         else:
-            await _send_requests_with_cache_policy(
+            storage_stats = await _send_requests_with_cache_policy(
                 llm=llm,
                 prefill_batches=prefill_batches,
                 normal_batches=normal_batches,
@@ -1407,11 +1453,17 @@ async def run_trie_experiment(
                 tokenizer_eos_id=tokenizer.eos_token_id,
                 batch_size=config.batch_size,
             )
+        if cache_run:
+            cache_run.stats.merge(storage_stats)
         print("[TRIE] 所有请求执行完成")
     finally:
-        print("[TRIE] 关闭 Engine ...")
-        llm.shutdown()
-        await asyncio.sleep(2)
+        try:
+            if cache_bundle:
+                await cache_bundle.detach(llm, cache_run)
+        finally:
+            print("[TRIE] 关闭 Engine ...")
+            llm.shutdown()
+            await asyncio.sleep(2)
 
     elapsed = time.time() - t0
     print(f"[TRIE] 完成, 总耗时 {elapsed:.1f}s")
@@ -1438,7 +1490,7 @@ async def run_trie_experiment(
         ]
         num_scheduled_batches = len(prefill_batches) + len(normal_batches)
 
-    return {
+    result = {
         "elapsed_seconds": elapsed,
         "num_requests": len(flat_seqs),
         "trie_stats": {
@@ -1463,6 +1515,9 @@ async def run_trie_experiment(
         },
         "batches_detail": batches_detail,
     }
+    if cache_bundle:
+        result["persistent_cache"] = cache_bundle.run_summary(cache_run)
+    return result
 
 
 # ============================================================
@@ -1728,6 +1783,18 @@ async def main() -> None:
         help=f"实验结果根目录 (默认: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--import-cache",
+        type=Path,
+        default=None,
+        help="只读导入 SGLang 解码器 KV 缓存包",
+    )
+    parser.add_argument(
+        "--export-cache",
+        type=Path,
+        default=None,
+        help="导出可跨进程复用的 SGLang 解码器 KV 缓存包",
+    )
+    parser.add_argument(
         "--skip-baseline",
         action="store_true",
         help="跳过基线实验",
@@ -1747,6 +1814,26 @@ async def main() -> None:
         parser.error("--gpu-memory-utilization 必须在 (0, 1] 范围内")
     if args.backend == "vllm" and args.skip_baseline:
         parser.error("--backend vllm 只运行基线，不能同时指定 --skip-baseline")
+    cache_requested = args.import_cache is not None or args.export_cache is not None
+    if cache_requested and args.backend != "sglang":
+        parser.error("--import-cache/--export-cache 仅支持 SGLang 后端")
+    if cache_requested and args.skip_baseline and args.skip_trie:
+        parser.error("缓存导入/导出至少需要一个未跳过的 SGLang 实验分支")
+
+    cache_compatibility: Optional[Dict[str, Any]] = None
+    import_cache_manifest: Optional[Dict[str, Any]] = None
+    if cache_requested:
+        _load_sglang()
+        cache_compatibility = build_compatibility(
+            args.model_path,
+            page_size=SGLANG_PAGE_SIZE,
+            dtype="auto",
+            attention_backend="triton",
+            multimodal=False,
+        )
+        import_cache_manifest = inspect_import_bundle(
+            args.import_cache, cache_compatibility
+        )
 
     # ============================================================
     # Step 1: 加载数据集并 Token 化
@@ -1799,6 +1886,13 @@ async def main() -> None:
         "run_cstrie": args.backend == "sglang" and not args.skip_trie,
         "vllm_block_size": VLLM_BLOCK_SIZE if args.backend == "vllm" else None,
         "sglang_page_size": SGLANG_PAGE_SIZE if args.backend == "sglang" else None,
+        **(
+            cache_identity_parameters(
+                import_cache_manifest, export_enabled=args.export_cache is not None
+            )
+            if cache_requested
+            else {}
+        ),
     }
     identity = build_identity(dataset_hashes, identity_parameters)
     experiment_dir = result_directory(args.output_dir, identity)
@@ -1808,6 +1902,20 @@ async def main() -> None:
         args.baseline_metrics = str(artifacts_dir / "baseline_metrics.jsonl")
     if args.trie_metrics is None:
         args.trie_metrics = str(artifacts_dir / "trie_metrics.jsonl")
+    cache_bundle: Optional[CacheBundle] = None
+    if cache_requested:
+        assert cache_compatibility is not None
+        cache_bundle = CacheBundle(
+            import_root=args.import_cache,
+            export_root=args.export_cache,
+            compatibility=cache_compatibility,
+            provenance={
+                "script": Path(__file__).name,
+                "run_id": identity["run_id"],
+                "datasets": list(args.datasets),
+                "dataset_hashes": dataset_hashes,
+            },
+        )
 
     # ============================================================
     # Step 2: 初始化结果容器
@@ -1826,6 +1934,18 @@ async def main() -> None:
             "batch_size": args.batch_size,
             "max_input_tokens": args.max_input_tokens,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            **(
+                {
+                    "import_cache": (
+                        str(args.import_cache) if args.import_cache else None
+                    ),
+                    "export_cache": (
+                        str(args.export_cache) if args.export_cache else None
+                    ),
+                }
+                if cache_requested
+                else {}
+            ),
         },
         "dataset_summary": {
             "num_samples": len(flat_seqs),
@@ -1900,9 +2020,18 @@ async def main() -> None:
                     )
                 )
             else:
+                baseline_cache_run = (
+                    cache_bundle.prepare_run(
+                        "text", "sglang", dataset_name, f"baseline-{dataset_name}"
+                    )
+                    if cache_bundle
+                    else None
+                )
                 baseline_info = await run_baseline_experiment(
                     config=baseline_config,
                     flat_seqs=dataset_flat_seqs,
+                    cache_bundle=cache_bundle,
+                    cache_run=baseline_cache_run,
                 )
                 baseline_metrics = parse_metrics_log(
                     dataset_metrics_path, rid_prefix=""
@@ -1995,11 +2124,20 @@ async def main() -> None:
                 gpu_memory_utilization=args.gpu_memory_utilization,
             )
             print(f"\n[TRIE] 数据集 {dataset_name}: 冷启动独立引擎")
+            trie_cache_run = (
+                cache_bundle.prepare_run(
+                    "text", "cstrie", dataset_name, f"cstrie-{dataset_name}"
+                )
+                if cache_bundle
+                else None
+            )
             trie_info = await run_trie_experiment(
                 config=trie_config,
                 request_token_seqs_map=dataset_map,
                 flat_seqs=dataset_flat_seqs,
                 dataset_names=[dataset_name],
+                cache_bundle=cache_bundle,
+                cache_run=trie_cache_run,
             )
             per_dataset_tries[dataset_name] = {
                 **trie_info,
@@ -2123,6 +2261,22 @@ async def main() -> None:
     # 统一保存结果
     # ============================================================
     standard_runs: List[Dict[str, Any]] = []
+    if cache_bundle:
+        exported_manifest = cache_bundle.finalize()
+        results["persistent_cache"] = {
+            "import_bundle_id": (
+                cache_bundle.import_manifest.get("bundle_id")
+                if cache_bundle.import_manifest
+                else None
+            ),
+            "export_bundle_id": (
+                exported_manifest.get("bundle_id") if exported_manifest else None
+            ),
+            "import_path": str(args.import_cache) if args.import_cache else None,
+            "export_path": str(args.export_cache) if args.export_cache else None,
+            "visual_encoder_cache_persisted": False,
+        }
+
     for field, default_backend, cache_policy in (
         ("baseline", args.backend, "native"),
         ("trie", "cstrie", "cstrie"),
@@ -2176,6 +2330,8 @@ async def main() -> None:
         runs=standard_runs,
     )
     envelope["details"] = {"comparison": results.get("comparison")}
+    if cache_requested:
+        envelope["details"]["persistent_cache"] = results.get("persistent_cache")
     write_experiment(envelope, experiment_dir)
     warnings = write_results_summary(args.output_dir)
     for warning in warnings:

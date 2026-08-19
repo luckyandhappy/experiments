@@ -16,6 +16,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import run_experiment
+from cache_bundle import (
+    CacheBundle,
+    CacheHitStats,
+    CacheRun,
+    build_compatibility,
+    cache_identity_parameters,
+    hicache_engine_kwargs,
+    inspect_import_bundle,
+)
 from experiment_results import (
     build_identity,
     make_envelope,
@@ -98,9 +107,10 @@ async def _run_sglang_requests(
     batch_size: int,
     eos_token_id: Optional[int],
     scheduled_batches: Optional[Sequence[Sequence[ScheduledRequest]]] = None,
-) -> List[float]:
+) -> tuple[List[float], CacheHitStats]:
     by_id = {request.request_id: request for request in requests}
     latencies: List[float] = []
+    storage_stats = CacheHitStats()
     semaphore = asyncio.Semaphore(batch_size)
 
     async def send(
@@ -113,7 +123,7 @@ async def _run_sglang_requests(
             if task and task.kind == "normal":
                 kwargs["bootstrap_host"] = run_experiment._FAKE_BOOTSTRAP_HOST
             started = time.perf_counter()
-            await llm.async_generate(
+            response = await llm.async_generate(
                 prompt=request.prompt,
                 image_data=_sglang_image_uri(request.image_path),
                 mm_hashes=[request.image_sha256],
@@ -126,6 +136,7 @@ async def _run_sglang_requests(
                 ),
                 **kwargs,
             )
+            storage_stats.observe(response)
             latencies.append(time.perf_counter() - started)
 
     if scheduled_batches is None:
@@ -134,7 +145,7 @@ async def _run_sglang_requests(
     else:
         for batch in scheduled_batches:
             await asyncio.gather(*(send(by_id[task.request_id], task) for task in batch))
-    return latencies
+    return latencies, storage_stats
 
 
 async def run_sglang(
@@ -146,6 +157,8 @@ async def run_sglang(
     metrics_log: Path,
     use_cstrie: bool,
     eos_token_id: Optional[int],
+    cache_bundle: Optional[CacheBundle] = None,
+    cache_run: Optional[CacheRun] = None,
 ) -> Dict[str, Any]:
     sgl = run_experiment._load_sglang()
     metrics_log.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +184,9 @@ async def run_sglang(
             "num_prefill_requests": sum(task.kind == "prefill" for task in tasks),
         }
 
+    cache_kwargs = (
+        hicache_engine_kwargs(cache_bundle.compatibility) if cache_bundle else {}
+    )
     llm = sgl.Engine(
         model_path=model_path,
         tp_size=1,
@@ -184,18 +200,28 @@ async def run_sglang(
         disable_radix_cache=False,
         log_level="info",
         attention_backend="triton",
+        **cache_kwargs,
     )
     started = time.perf_counter()
+    storage_stats = CacheHitStats()
     try:
-        latencies = await _run_sglang_requests(
+        if cache_bundle:
+            await cache_bundle.attach(llm, cache_run)
+        latencies, storage_stats = await _run_sglang_requests(
             llm, requests, batch_size, eos_token_id, scheduled_batches
         )
+        if cache_run:
+            cache_run.stats.merge(storage_stats)
         elapsed = time.perf_counter() - started
     finally:
-        llm.shutdown()
+        try:
+            if cache_bundle:
+                await cache_bundle.detach(llm, cache_run)
+        finally:
+            llm.shutdown()
     parsed = run_experiment.parse_metrics_log(str(metrics_log), rid_prefix="")
     encoder_metrics = parse_sglang_encoder_metrics(metrics_log)
-    return _build_run_result(
+    result = _build_run_result(
         requests,
         elapsed,
         latencies,
@@ -206,6 +232,10 @@ async def run_sglang(
         },
         trie_info=trie_info,
     )
+    if cache_bundle:
+        result["persistent_cache"] = cache_bundle.run_summary(cache_run)
+        result["persistent_cache"]["visual_encoder_cache_persisted"] = False
+    return result
 
 
 def _snapshot_deltas(before: Any, after: Any, keyword: str) -> Dict[str, float]:
@@ -623,11 +653,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--import-cache",
+        type=Path,
+        default=None,
+        help="只读导入 SGLang 解码器 KV 缓存包",
+    )
+    parser.add_argument(
+        "--export-cache",
+        type=Path,
+        default=None,
+        help="导出可跨进程复用的 SGLang 解码器 KV 缓存包",
+    )
     args = parser.parse_args()
     if args.repetitions <= 0 or args.batch_size <= 0:
         parser.error("--repetitions 和 --batch-size 必须大于 0")
     if not 0 < args.gpu_memory_utilization <= 1:
         parser.error("--gpu-memory-utilization 必须在 (0, 1] 范围内")
+    cache_requested = args.import_cache is not None or args.export_cache is not None
+    if cache_requested and args.backend == "vllm":
+        parser.error("--import-cache/--export-cache 不支持 vLLM 后端")
+    if cache_requested and args.prepare_only:
+        parser.error("--prepare-only 不执行推理，不能导入或导出 KV 缓存")
     try:
         args.dataset_paths = _parse_overrides(args.dataset_path, "--dataset-path")
         args.splits = _parse_overrides(args.split, "--split")
@@ -654,6 +701,7 @@ async def _run_dataset(
     manifest: Mapping[str, Any],
     processor: Any,
     dataset_dir: Path,
+    cache_bundle: Optional[CacheBundle] = None,
 ) -> tuple[Dict[str, Any], bool]:
     dataset = str(manifest["dataset"])
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -699,6 +747,16 @@ async def _run_dataset(
                 else:
                     if requests is None:
                         requests = prepare_requests(samples, processor)
+                    cache_run = (
+                        cache_bundle.prepare_run(
+                            "multimodal",
+                            backend,
+                            dataset,
+                            f"{dataset}-{backend}-rep-{repetition + 1}",
+                        )
+                        if cache_bundle
+                        else None
+                    )
                     run = await run_sglang(
                         requests,
                         args.model_path,
@@ -708,6 +766,8 @@ async def _run_dataset(
                         dataset_dir / f"{order}_{backend}_{repetition + 1}.jsonl",
                         backend == "cstrie",
                         eos_token_id,
+                        cache_bundle=cache_bundle,
+                        cache_run=cache_run,
                     )
             except Exception as exc:
                 has_errors = True
@@ -774,6 +834,21 @@ def _standard_runs(
 
 async def main() -> None:
     args = parse_args()
+    cache_requested = args.import_cache is not None or args.export_cache is not None
+    cache_compatibility: Optional[Dict[str, Any]] = None
+    import_cache_manifest: Optional[Dict[str, Any]] = None
+    if cache_requested:
+        run_experiment._load_sglang()
+        cache_compatibility = build_compatibility(
+            args.model_path,
+            page_size=run_experiment.SGLANG_PAGE_SIZE,
+            dtype="auto",
+            attention_backend="triton",
+            multimodal=True,
+        )
+        import_cache_manifest = inspect_import_bundle(
+            args.import_cache, cache_compatibility
+        )
     if args.backend == "vllm" and not args.prepare_only:
         # Must run before AutoProcessor and prepare_requests create the Rust
         # tokenizer worker pool used by the parent process.
@@ -807,6 +882,13 @@ async def main() -> None:
         "vllm_block_size": (
             run_experiment.VLLM_BLOCK_SIZE if args.backend == "vllm" else None
         ),
+        **(
+            cache_identity_parameters(
+                import_cache_manifest, export_enabled=args.export_cache is not None
+            )
+            if cache_requested
+            else {}
+        ),
     }
     identity = build_identity(
         {dataset: manifest["records_sha256"] for dataset, manifest in manifests.items()},
@@ -814,6 +896,24 @@ async def main() -> None:
     )
     experiment_dir = result_directory(args.output_dir, identity)
     artifacts_dir = experiment_dir / "artifacts"
+    cache_bundle: Optional[CacheBundle] = None
+    if cache_requested:
+        assert cache_compatibility is not None
+        cache_bundle = CacheBundle(
+            import_root=args.import_cache,
+            export_root=args.export_cache,
+            compatibility=cache_compatibility,
+            provenance={
+                "script": Path(__file__).name,
+                "run_id": identity["run_id"],
+                "datasets": list(args.datasets),
+                "backend": args.backend,
+                "dataset_hashes": {
+                    dataset: manifest["records_sha256"]
+                    for dataset, manifest in manifests.items()
+                },
+            },
+        )
     for dataset, manifest in manifests.items():
         manifest_path = artifacts_dir / dataset / "manifest.json"
         write_manifest(manifest, manifest_path)
@@ -847,9 +947,15 @@ async def main() -> None:
         dataset_artifacts = artifacts_dir / dataset
         try:
             result, dataset_has_errors = await _run_dataset(
-                args, manifests[dataset], processor, dataset_artifacts
+                args,
+                manifests[dataset],
+                processor,
+                dataset_artifacts,
+                cache_bundle=cache_bundle,
             )
         except Exception:
+            if cache_bundle:
+                cache_bundle.abort_staging()
             partial_path = dataset_artifacts / "backend_runs.json"
             if partial_path.is_file():
                 results[dataset] = json.loads(partial_path.read_text(encoding="utf-8"))
@@ -876,6 +982,28 @@ async def main() -> None:
             runs=_standard_runs(results),
             status="partial" if has_errors else "completed",
         )
+        write_experiment(envelope, experiment_dir)
+    persistent_cache: Optional[Dict[str, Any]] = None
+    if cache_bundle:
+        if has_errors:
+            cache_bundle.abort_staging()
+            exported_manifest = None
+        else:
+            exported_manifest = cache_bundle.finalize()
+        persistent_cache = {
+            "import_bundle_id": (
+                cache_bundle.import_manifest.get("bundle_id")
+                if cache_bundle.import_manifest
+                else None
+            ),
+            "export_bundle_id": (
+                exported_manifest.get("bundle_id") if exported_manifest else None
+            ),
+            "import_path": str(args.import_cache) if args.import_cache else None,
+            "export_path": str(args.export_cache) if args.export_cache else None,
+            "visual_encoder_cache_persisted": False,
+        }
+        envelope["details"] = {"persistent_cache": persistent_cache}
         write_experiment(envelope, experiment_dir)
     warnings = write_results_summary(args.output_dir)
     for warning in warnings:
